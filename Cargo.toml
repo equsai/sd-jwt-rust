@@ -25,7 +25,10 @@ serde_json = { version = "1.0.113", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "1.0.51"
 strum = { version = "0.25", default-features = false, features = ["std", "derive"] }
+async-trait = "0.1.81"
 
 [dev-dependencies]
 rstest = "0.18.2"
 regex = "1.10"
+async-std = { version = "1.12.0", features = ["attributes"] }
+async-std-test = "0.0.4"

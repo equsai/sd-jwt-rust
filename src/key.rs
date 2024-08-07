@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, crypto, EncodingKey};
 use crate::DEFAULT_SIGNING_ALG;
 use crate::error::{ Error, Result};
@@ -26,6 +27,7 @@ impl SDJWTKey {
     }
 }
 
+#[async_trait]
 impl SDJWTSigner for SDJWTKey {
     /// Description. See [SDJWTSigner::algorithm] for further information.
     fn algorithm(&self) -> &str {
@@ -33,7 +35,7 @@ impl SDJWTSigner for SDJWTKey {
     }
 
     /// Description. See [SDJWTSigner::sign] for further information.
-    fn sign(&self, message: &[u8]) -> Result<String> {
+    async fn sign(&self, message: &[u8]) -> Result<String> {
         let algorithm = Algorithm::from_str(self.algorithm())
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
 

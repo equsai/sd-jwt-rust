@@ -374,6 +374,7 @@ impl SDJWTVerifier {
 
 #[cfg(test)]
 mod tests {
+    use async_std_test::async_test;
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
     use crate::{SDJWTHolder, SDJWTIssuer, SDJWTVerifier, SDJWTSerializationFormat};
     use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -385,8 +386,8 @@ mod tests {
     const PRIVATE_ISSUER_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMFECAQEwBQYDK2VwBCIEIF93k6rxZ8W38cm0rOwfGdH+YY3k10hP+7gd0falPLg0\ngSEAdW31QyWzfed4EPcw1rYuUa1QU+fXEL0HhdAfYZRkihc=\n-----END PRIVATE KEY-----\n";
     const PUBLIC_ISSUER_ED25519_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAdW31QyWzfed4EPcw1rYuUa1QU+fXEL0HhdAfYZRkihc=\n-----END PUBLIC KEY-----\n";
 
-    #[test]
-    fn verify_full_presentation() {
+    #[async_test]
+    async fn verify_full_presentation() -> std::io::Result<()> {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -412,7 +413,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
@@ -421,7 +422,7 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .await.unwrap();
         assert_eq!(sd_jwt, presentation);
         let verified_claims = SDJWTVerifier::new(
             presentation,
@@ -436,10 +437,12 @@ mod tests {
             .unwrap()
             .verified_claims;
         assert_eq!(user_claims, verified_claims);
+
+        Ok(())
     }
 
-    #[test]
-    fn verify_noclaim_presentation() {
+    #[async_test]
+    async fn verify_noclaim_presentation() -> std::io::Result<()> {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -465,7 +468,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
 
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
             .unwrap()
@@ -475,7 +478,7 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .await.unwrap();
         assert_eq!(sd_jwt, presentation);
         let verified_claims = SDJWTVerifier::new(
             presentation,
@@ -490,10 +493,12 @@ mod tests {
             .unwrap()
             .verified_claims;
         assert_eq!(user_claims, verified_claims);
+
+        Ok(())
     }
 
-    #[test]
-    fn verify_arrayed_presentation() {
+    #[async_test]
+    async fn verify_arrayed_presentation() -> std::io::Result<()> {
         let user_claims = json!(
             {
               "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
@@ -540,7 +545,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
 
         let mut claims_to_disclose = user_claims.clone();
         claims_to_disclose["addresses"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
@@ -554,7 +559,7 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .await.unwrap();
 
         let verified_claims = SDJWTVerifier::new(
             presentation.clone(),
@@ -597,10 +602,12 @@ mod tests {
         );
 
         assert_eq!(verified_claims, expected_verified_claims);
+
+        Ok(())
     }
 
-    #[test]
-    fn verify_arrayed_no_sd_presentation() {
+    #[async_test]
+    async fn verify_arrayed_no_sd_presentation() -> std::io::Result<()> {
         let user_claims = json!(
             {
                 "iss": "https://example.com/issuer",
@@ -640,7 +647,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
 
         let claims_to_disclose = json!({});
 
@@ -652,7 +659,7 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .await.unwrap();
 
         let verified_claims = SDJWTVerifier::new(
             presentation.clone(),
@@ -681,10 +688,12 @@ mod tests {
         );
 
         assert_eq!(verified_claims, expected_verified_claims);
+
+        Ok(())
     }
 
-    #[test]
-    fn verify_full_presentation_to_allow_other_algorithms_json_format() {
+    #[async_test]
+    async fn verify_full_presentation_to_allow_other_algorithms_json_format() -> std::io::Result<()> {
 
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
@@ -711,7 +720,7 @@ mod tests {
             SDJWTSerializationFormat::JSON, // Changed to Json format
             None,
         )
-        .unwrap();
+        .await.unwrap();
        
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON) // Changed to Json format
             .unwrap()
@@ -721,7 +730,7 @@ mod tests {
                 None,
                 None
             )
-            .unwrap();
+            .await.unwrap();
         assert_eq!(sd_jwt, presentation);
         let verified_claims = SDJWTVerifier::new(
             presentation,
@@ -736,5 +745,7 @@ mod tests {
             .unwrap()
             .verified_claims;
         assert_eq!(user_claims, verified_claims);
+
+        Ok(())
     }
 }
