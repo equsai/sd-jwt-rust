@@ -43,6 +43,9 @@ pub enum Error {
     #[error("key not found: {0}")]
     KeyNotFound(String),
 
+    #[error("signing error: {0}")]
+    SigningError(String),
+
     #[error("{0}")]
     Unspecified(String),
 }

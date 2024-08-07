@@ -13,6 +13,10 @@ use serde_json::Value;
 use sha2::Digest;
 #[cfg(feature = "mock_salts")]
 use std::{collections::VecDeque, sync::Mutex};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jsonwebtoken::Header;
+use serde::Serialize;
+use crate::signer::SDJWTSigner;
 
 #[cfg(feature = "mock_salts")]
 lazy_static! {
@@ -59,4 +63,23 @@ pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String
             .map_err(|e| DeserializationError(e.to_string()))?,
     )
         .map_err(|e| DeserializationError(e.to_string()))
+}
+
+pub(crate) fn encode<T: Serialize>(
+    header: &Header,
+    claims: &T,
+    signer: &dyn SDJWTSigner
+) -> Result<String> {
+    let encoded_header = b64_encode_part(header)?;
+    let encoded_claims = b64_encode_part(claims)?;
+    let message = [encoded_header, encoded_claims].join(".");
+    let signature = signer.sign(message.as_bytes())?;
+
+    Ok([message, signature].join("."))
+}
+
+pub(crate) fn b64_encode_part<T: Serialize>(input: &T) -> Result<String> {
+    let json = serde_json::to_vec(input)
+        .map_err(|e| Error::DeserializationError(e.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(json))
 }
