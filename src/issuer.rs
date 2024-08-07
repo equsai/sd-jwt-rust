@@ -154,10 +154,10 @@ impl SDJWTIssuer {
     ///
     /// # Returns
     /// The issued SD-JWT as a string in the requested serialization format.
-    pub fn issue_sd_jwt(
+    pub async fn issue_sd_jwt(
         &mut self,
         user_claims: Value,
-        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
         holder_key: Option<Jwk>,
         add_decoy_claims: bool,
         serialization_format: SDJWTSerializationFormat,
@@ -179,7 +179,7 @@ impl SDJWTIssuer {
         self.extra_header_parameters = extra_header_parameters;
 
         self.assemble_sd_jwt_payload(user_claims, sd_strategy)?;
-        self.create_signed_jws()?;
+        self.create_signed_jws().await?;
         self.create_combined()?;
 
         Ok(self.serialized_sd_jwt.clone())
@@ -292,7 +292,7 @@ impl SDJWTIssuer {
         Value::Object(claims)
     }
 
-    fn create_signed_jws(&mut self) -> Result<()> {
+    async fn create_signed_jws(&mut self) -> Result<()> {
         let mut header = Header::new(
             Algorithm::from_str(&self.signer.algorithm())
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
@@ -320,7 +320,7 @@ impl SDJWTIssuer {
             }
         }
 
-        self.signed_sd_jwt = encode(&header, &self.sd_jwt_payload, &*self.signer)?;
+        self.signed_sd_jwt = encode(&header, &self.sd_jwt_payload, &*self.signer).await?;
 
         Ok(())
     }
@@ -379,6 +379,7 @@ impl SDJWTIssuer {
 
 #[cfg(test)]
 mod tests {
+    use async_std_test::async_test;
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
@@ -388,8 +389,8 @@ mod tests {
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 
-    #[test]
-    fn test_assembly_sd_full_recursive() {
+    #[async_test]
+    async fn test_assembly_sd_full_recursive() -> std::io::Result<()> {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -418,8 +419,10 @@ mod tests {
                 ("kid".to_string(), "GNWaAL2PVUU2JIT89m6q0c7Svc40S-bvR1SOD7DFBoU".to_string()),
             ].iter().cloned().collect()),
         )
-            .unwrap();
-        println!("{:?}", sd_jwt)
+            .await.unwrap();
+        println!("{:?}", sd_jwt);
+
+        Ok(())
     }
 
     #[test]

@@ -12,6 +12,7 @@ use sd_jwt_rs::{SDJWTHolder, SDJWTIssuer, SDJWTJson, SDJWTVerifier, SDJWTSeriali
 use sd_jwt_rs::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use sd_jwt_rs::key::SDJWTKey;
 
 mod utils;
 
@@ -285,11 +286,11 @@ fn presentation_metadata() -> (
 #[case(nested_array())]
 #[case(complex_eidas())]
 #[case(w3c_vc())]
-fn demo_positive_cases(
+async fn demo_positive_cases(
     issuer_key: EncodingKey,
     #[case] data: (
         serde_json::Value,
-        ClaimsForSelectiveDisclosureStrategy,
+        ClaimsForSelectiveDisclosureStrategy<'_>,
         Map<String, Value>,
         usize,
     ),
@@ -306,26 +307,27 @@ fn demo_positive_cases(
     let (user_claims, strategy, holder_disclosed_claims, number_of_revealed_sds) = data;
     let (nonce, aud, holder_key, holder_jwk) = presentation_metadata;
     // Issuer issues SD-JWT
-    let sd_jwt = SDJWTIssuer::new(issuer_key, sign_algo.clone()).issue_sd_jwt(
+    let sd_jwt = SDJWTIssuer::new(Box::new(SDJWTKey::new(issuer_key, sign_algo.clone()))).issue_sd_jwt(
         user_claims.clone(),
         strategy,
         holder_jwk.clone(),
         add_decoy,
         format.clone(),
+        None,
     )
-        .unwrap();
+        .await.unwrap();
     let issued = sd_jwt.clone();
     // Holder creates presentation
     let mut holder = SDJWTHolder::new(sd_jwt.clone(), format.clone()).unwrap();
+    let signer = holder_key.map(|k| Box::new(SDJWTKey::new(k, sign_algo))).map(|x| x as _);
     let presentation = holder
         .create_presentation(
             holder_disclosed_claims,
             nonce.clone(),
             aud.clone(),
-            holder_key,
-            sign_algo,
+            signer,
         )
-        .unwrap();
+        .await.unwrap();
 
     if format == SDJWTSerializationFormat::Compact {
         let mut issued_parts: HashSet<&str> = issued

@@ -30,11 +30,6 @@ const JWT_SEPARATOR: &str = ".";
 const CNF_KEY: &str = "cnf";
 const JWK_KEY: &str = "jwk";
 
-#[derive(Debug)]
-pub(crate) struct SDJWTHasSDClaimException(String);
-
-impl SDJWTHasSDClaimException {}
-
 /// SDJWTSerializationFormat is used to determine how an SD-JWT is serialized to String
 #[derive(Default, Clone, PartialEq, Debug, Display)]
 pub enum SDJWTSerializationFormat {

@@ -1,6 +1,8 @@
+use async_trait::async_trait;
 use crate::error::Result;
 
-pub trait SDJWTSigner {
+#[async_trait]
+pub trait SDJWTSigner: Sync + Send {
     /// Return the source algorithm.
     fn algorithm(&self) -> &str;
 
@@ -9,5 +11,5 @@ pub trait SDJWTSigner {
     /// # Arguments
     ///
     /// * `message` - The message data to sign.
-    fn sign(&self, message: &[u8]) -> Result<String>;
+    async fn sign(&self, message: &[u8]) -> Result<String>;
 }

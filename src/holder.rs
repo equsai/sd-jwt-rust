@@ -88,12 +88,12 @@ impl SDJWTHolder {
     ///
     /// # Returns
     /// * `String` - Presentation in the format specified by `serialization_format` in the constructor. It can be either compact or json.
-    pub fn create_presentation(
+    pub async fn create_presentation(
         &mut self,
         claims_to_disclose: Map<String, Value>,
         nonce: Option<String>,
         aud: Option<String>,
-        signer: Option<&dyn SDJWTSigner>,
+        signer: Option<Box<dyn SDJWTSigner>>,
     ) -> Result<String> {
         self.key_binding_jwt_header = Default::default();
         self.key_binding_jwt_payload = Default::default();
@@ -102,7 +102,7 @@ impl SDJWTHolder {
 
         match (nonce, aud, signer) {
             (Some(nonce), Some(aud), Some(signer)) => {
-                self.create_key_binding_jwt(nonce, aud, signer)?
+                self.create_key_binding_jwt(nonce, aud, signer).await?
             }
             (None, None, None) => {}
             _ => {
@@ -293,11 +293,11 @@ impl SDJWTHolder {
 
         Ok(hash_to_disclosure)
     }
-    fn create_key_binding_jwt(
+    async fn create_key_binding_jwt(
         &mut self,
         nonce: String,
         aud: String,
-        signer: &dyn SDJWTSigner
+        signer: Box<dyn SDJWTSigner>
     ) -> Result<()> {
         let alg = signer.algorithm();
         // Set key-binding fields
@@ -323,7 +323,7 @@ impl SDJWTHolder {
         );
 
         header.typ = Some(crate::KB_JWT_TYP_HEADER.into());
-        self.serialized_key_binding_jwt = encode(&header, &self.key_binding_jwt_payload, signer)?;
+        self.serialized_key_binding_jwt = encode(&header, &self.key_binding_jwt_payload, &*signer).await?;
         Ok(())
     }
 
@@ -348,6 +348,7 @@ mod tests {
     use jsonwebtoken::EncodingKey;
     use serde_json::{json, Map, Value};
     use std::collections::HashSet;
+    use async_std_test::async_test;
     use crate::key::SDJWTKey;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
@@ -360,8 +361,8 @@ mod tests {
             "d": "0tI02eGRti3I3oVDJNJPjnqZPLoTgb1LjAKHghdHS6g"
          }"#;
 
-    #[test]
-    fn create_full_presentation() {
+    #[async_test]
+    async fn create_full_presentation() -> std::io::Result<()> {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -387,7 +388,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
         let presentation = SDJWTHolder::new(
             sd_jwt.clone(),
             SDJWTSerializationFormat::Compact,
@@ -399,11 +400,13 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .await.unwrap();
         assert_eq!(sd_jwt, presentation);
+
+        Ok(())
     }
-    #[test]
-    fn create_presentation_empty_object_as_disclosure_value() {
+    #[async_test]
+    async fn create_presentation_empty_object_as_disclosure_value() -> std::io::Result<()> {
         let mut user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -430,7 +433,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
         let issued = sd_jwt.clone();
         user_claims["address"] = Value::Object(Map::new());
         let presentation =
@@ -442,7 +445,7 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap();
+                .await.unwrap();
 
         let mut parts: Vec<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
@@ -453,10 +456,12 @@ mod tests {
         parts.remove(2);
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
+
+        Ok(())
     }
 
-    #[test]
-    fn create_presentation_for_arrayed_disclosures() {
+    #[async_test]
+    async fn create_presentation_for_arrayed_disclosures() -> std::io::Result<()> {
         let mut user_claims = json!(
             {
               "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
@@ -501,7 +506,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
             None,
         )
-            .unwrap();
+            .await.unwrap();
         // Choose what to reveal
         user_claims["addresses"] = Value::Array(vec![Value::Bool(true), Value::Bool(false)]);
         user_claims["nationalities"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
@@ -517,7 +522,7 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap();
+                .await.unwrap();
         println!("{}", presentation);
         let mut issued_parts: HashSet<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
@@ -531,10 +536,12 @@ mod tests {
 
         let union: HashSet<_> = issued_parts.intersection(&revealed_parts).collect();
         assert_eq!(union.len(), 3);
+
+        Ok(())
     }
 
-    #[test]
-    fn create_presentation_for_recursive_disclosures() {
+    #[async_test]
+    async fn create_presentation_for_recursive_disclosures() -> std::io::Result<()> {
         // Input data used to create the SD-JWT and presentation fixtures,
         // can be used to debug in case the test fails:
 
@@ -637,7 +644,7 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap();
+                .await.unwrap();
 
         let presentation: HashSet<_> = presentation
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR).map(String::from)
@@ -648,10 +655,12 @@ mod tests {
             .map(String::from).collect();
 
         assert_eq!(presentation, expected);
+
+        Ok(())
     }
 
-    #[test]
-    fn create_presentation_with_key_binding() {
+    #[async_test]
+    async fn create_presentation_with_key_binding() -> std::io::Result<()> {
         let mut user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -682,7 +691,7 @@ mod tests {
             false,
             SDJWTSerializationFormat::Compact,
             None,
-        ).unwrap();
+        ).await.unwrap();
 
         user_claims["address"] = Value::Object(Map::new());
         let presentation_with_kb =
@@ -692,9 +701,9 @@ mod tests {
                     user_claims.as_object().unwrap().clone(),
                     Some("1".to_string()),
                     Some("https://example.com/aud".to_string()),
-                    Some(&SDJWTKey::new(holder_key, None)),
+                    Some(Box::new(SDJWTKey::new(holder_key, None))),
                 )
-                .unwrap();
+                .await.unwrap();
 
         // TODO: Validate Key Binding part
         let (presentation, _) = presentation_with_kb
@@ -713,5 +722,7 @@ mod tests {
         parts.remove(2);
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
+
+        Ok(())
     }
 }
