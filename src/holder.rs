@@ -1,17 +1,20 @@
 use crate::{error, SDJWTJson, SDJWTSerializationFormat};
 use error::{Error, Result};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, Header};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time;
 
-use crate::utils::base64_hash;
+use crate::utils::{base64_hash, encode};
 use crate::SDJWTCommon;
 use crate::{
-    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG, KB_DIGEST_KEY, SD_DIGESTS_KEY,
+    COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+    KB_DIGEST_KEY,
+    SD_DIGESTS_KEY,
     SD_LIST_PREFIX,
 };
+use crate::signer::SDJWTSigner;
 
 pub struct SDJWTHolder {
     sd_jwt_engine: SDJWTCommon,
@@ -81,8 +84,7 @@ impl SDJWTHolder {
     /// * `claims_to_disclose` - Claims to disclose in the presentation
     /// * `nonce` - Nonce to be used in the key-binding JWT
     /// * `aud` - Audience to be used in the key-binding JWT
-    /// * `holder_key` - Key to sign the key-binding JWT
-    /// * `sign_alg` - Signing algorithm to be used in the key-binding JWT
+    /// * `signer` - Signer used to sign the key-binding JWT
     ///
     /// # Returns
     /// * `String` - Presentation in the format specified by `serialization_format` in the constructor. It can be either compact or json.
@@ -91,17 +93,16 @@ impl SDJWTHolder {
         claims_to_disclose: Map<String, Value>,
         nonce: Option<String>,
         aud: Option<String>,
-        holder_key: Option<EncodingKey>,
-        sign_alg: Option<String>,
+        signer: Option<&dyn SDJWTSigner>,
     ) -> Result<String> {
         self.key_binding_jwt_header = Default::default();
         self.key_binding_jwt_payload = Default::default();
         self.serialized_key_binding_jwt = Default::default();
         self.hs_disclosures = self.select_disclosures(&self.sd_jwt_payload, claims_to_disclose)?;
 
-        match (nonce, aud, holder_key) {
-            (Some(nonce), Some(aud), Some(holder_key)) => {
-                self.create_key_binding_jwt(nonce, aud, &holder_key, sign_alg)?
+        match (nonce, aud, signer) {
+            (Some(nonce), Some(aud), Some(signer)) => {
+                self.create_key_binding_jwt(nonce, aud, signer)?
             }
             (None, None, None) => {}
             _ => {
@@ -296,13 +297,12 @@ impl SDJWTHolder {
         &mut self,
         nonce: String,
         aud: String,
-        holder_key: &EncodingKey,
-        sign_alg: Option<String>,
+        signer: &dyn SDJWTSigner
     ) -> Result<()> {
-        let alg = sign_alg.unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
+        let alg = signer.algorithm();
         // Set key-binding fields
         self.key_binding_jwt_header
-            .insert("alg".to_string(), alg.clone().into());
+            .insert("alg".to_string(), alg.into());
         self.key_binding_jwt_header
             .insert("typ".to_string(), crate::KB_JWT_TYP_HEADER.into());
         self.key_binding_jwt_payload
@@ -318,13 +318,12 @@ impl SDJWTHolder {
         self.set_key_binding_digest_key()?;
         // Create key-binding jwt
         let mut header = Header::new(
-            Algorithm::from_str(alg.as_str())
+            Algorithm::from_str(alg)
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
         );
+
         header.typ = Some(crate::KB_JWT_TYP_HEADER.into());
-        self.serialized_key_binding_jwt =
-            jsonwebtoken::encode(&header, &self.key_binding_jwt_payload, holder_key)
-                .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        self.serialized_key_binding_jwt = encode(&header, &self.key_binding_jwt_payload, signer)?;
         Ok(())
     }
 
@@ -349,8 +348,17 @@ mod tests {
     use jsonwebtoken::EncodingKey;
     use serde_json::{json, Map, Value};
     use std::collections::HashSet;
+    use crate::key::SDJWTKey;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
+    const PRIVATE_HOLDER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg0tI02eGRti3I3oVD\nJNJPjnqZPLoTgb1LjAKHghdHS6ihRANCAATcyYx2XscFQm+cq9hXjzhP+IhocalY\nWuBJDqoAjF1BtV159qmKAVtBk1RkN4rVlwGCvHElWbqzXQmbzi/psban\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_HOLDER_JWK: &str = r#"{
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "3MmMdl7HBUJvnKvYV484T_iIaHGpWFrgSQ6qAIxdQbU",
+            "y": "XXn2qYoBW0GTVGQ3itWXAYK8cSVZurNdCZvOL-mxtqc",
+            "d": "0tI02eGRti3I3oVDJNJPjnqZPLoTgb1LjAKHghdHS6g"
+         }"#;
 
     #[test]
     fn create_full_presentation() {
@@ -367,13 +375,17 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
         let presentation = SDJWTHolder::new(
@@ -383,7 +395,6 @@ mod tests {
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
-                None,
                 None,
                 None,
                 None,
@@ -406,14 +417,18 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
 
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
         let issued = sd_jwt.clone();
@@ -423,7 +438,6 @@ mod tests {
                 .unwrap()
                 .create_presentation(
                     user_claims.as_object().unwrap().clone(),
-                    None,
                     None,
                     None,
                     None,
@@ -475,13 +489,17 @@ mod tests {
         ]);
 
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             strategy,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
         // Choose what to reveal
@@ -495,7 +513,6 @@ mod tests {
                 .unwrap()
                 .create_presentation(
                     user_claims.as_object().unwrap().clone(),
-                    None,
                     None,
                     None,
                     None,
@@ -619,7 +636,6 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .unwrap();
 
@@ -632,5 +648,70 @@ mod tests {
             .map(String::from).collect();
 
         assert_eq!(presentation, expected);
+    }
+
+    #[test]
+    fn create_presentation_with_key_binding() {
+        let mut user_claims = json!({
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "address": {
+                "street_address": "Schulstr. 12",
+                "locality": "Schulpforta",
+                "region": "Sachsen-Anhalt",
+                "country": "DE"
+            }
+        });
+
+        let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+
+        let private_holder_bytes = PRIVATE_HOLDER_PEM.as_bytes();
+        let holder_key = EncodingKey::from_ec_pem(private_holder_bytes).unwrap();
+        let holder_public_jwk = serde_json::from_value(PUBLIC_HOLDER_JWK.parse().unwrap()).unwrap();
+
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
+            user_claims.clone(),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            Some(holder_public_jwk),
+            false,
+            SDJWTSerializationFormat::Compact,
+            None,
+        ).unwrap();
+
+        user_claims["address"] = Value::Object(Map::new());
+        let presentation_with_kb =
+            SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
+                .unwrap()
+                .create_presentation(
+                    user_claims.as_object().unwrap().clone(),
+                    Some("1".to_string()),
+                    Some("https://example.com/aud".to_string()),
+                    Some(&SDJWTKey::new(holder_key, None)),
+                )
+                .unwrap();
+
+        // TODO: Validate Key Binding part
+        let (presentation, _) = presentation_with_kb
+            .rsplit_once(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .unwrap();
+
+        let presentation = format!("{presentation}{COMBINED_SERIALIZATION_FORMAT_SEPARATOR}");
+
+        let mut parts: Vec<&str> = sd_jwt
+            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .collect();
+
+        parts.remove(5);
+        parts.remove(4);
+        parts.remove(3);
+        parts.remove(2);
+        let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
+        assert_eq!(expected, presentation);
     }
 }

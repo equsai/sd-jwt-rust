@@ -378,6 +378,7 @@ mod tests {
     use crate::{SDJWTHolder, SDJWTIssuer, SDJWTVerifier, SDJWTSerializationFormat};
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use serde_json::{json, Value};
+    use crate::key::SDJWTKey;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
     const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
@@ -399,20 +400,23 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
-                None,
                 None,
                 None,
                 None,
@@ -449,13 +453,17 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
 
@@ -463,7 +471,6 @@ mod tests {
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
-                None,
                 None,
                 None,
                 None,
@@ -515,19 +522,23 @@ mod tests {
             }
         );
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
         let strategy = ClaimsForSelectiveDisclosureStrategy::Custom(vec![
             "$.name",
             "$.addresses[1]",
             "$.addresses[1].country",
             "$.nationalities[0]",
         ]);
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             strategy,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
 
@@ -539,7 +550,6 @@ mod tests {
             .unwrap()
             .create_presentation(
                 claims_to_disclose.as_object().unwrap().clone(),
-                None,
                 None,
                 None,
                 None,
@@ -610,7 +620,10 @@ mod tests {
             }
         );
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
         let strategy = ClaimsForSelectiveDisclosureStrategy::Custom(vec![
             "$.array_with_recursive_sd[1]",
             "$.array_with_recursive_sd[1].baz",
@@ -619,12 +632,13 @@ mod tests {
             "$.test2[0]",
             "$.test2[1]",
         ]);
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             strategy,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
             .unwrap();
 
@@ -634,7 +648,6 @@ mod tests {
             .unwrap()
             .create_presentation(
                 claims_to_disclose.as_object().unwrap().clone(),
-                None,
                 None,
                 None,
                 None,
@@ -686,21 +699,24 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_ED25519_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ed_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, Some("EdDSA".to_string())).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ed_pem(private_issuer_bytes).unwrap(),
+            Some("EdDSA".to_string())
+        );
+        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::JSON, // Changed to Json format
+            None,
         )
-            .unwrap();
+        .unwrap();
        
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON) // Changed to Json format
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
-                None,
                 None,
                 None,
                 None

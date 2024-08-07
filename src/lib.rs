@@ -14,6 +14,8 @@ pub mod holder;
 pub mod issuer;
 pub mod utils;
 pub mod verifier;
+pub mod signer;
+pub mod key;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
 const SD_DIGESTS_KEY: &str = "_sd";
