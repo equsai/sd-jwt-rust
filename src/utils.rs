@@ -65,10 +65,10 @@ pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String
         .map_err(|e| DeserializationError(e.to_string()))
 }
 
-pub(crate) async fn encode<T: Serialize>(
+pub(crate) async fn encode<T: Serialize, S: SDJWTSigner>(
     header: &Header,
     claims: &T,
-    signer: &dyn SDJWTSigner
+    signer: &S
 ) -> Result<String> {
     let encoded_header = b64_encode_part(header)?;
     let encoded_claims = b64_encode_part(claims)?;

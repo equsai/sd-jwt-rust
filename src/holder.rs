@@ -88,12 +88,12 @@ impl SDJWTHolder {
     ///
     /// # Returns
     /// * `String` - Presentation in the format specified by `serialization_format` in the constructor. It can be either compact or json.
-    pub async fn create_presentation(
+    pub async fn create_presentation<S: SDJWTSigner>(
         &mut self,
         claims_to_disclose: Map<String, Value>,
         nonce: Option<String>,
         aud: Option<String>,
-        signer: Option<Box<dyn SDJWTSigner>>,
+        signer: Option<S>,
     ) -> Result<String> {
         self.key_binding_jwt_header = Default::default();
         self.key_binding_jwt_payload = Default::default();
@@ -293,11 +293,11 @@ impl SDJWTHolder {
 
         Ok(hash_to_disclosure)
     }
-    async fn create_key_binding_jwt(
+    async fn create_key_binding_jwt<S: SDJWTSigner>(
         &mut self,
         nonce: String,
         aud: String,
-        signer: Box<dyn SDJWTSigner>
+        signer: S,
     ) -> Result<()> {
         let alg = signer.algorithm();
         // Set key-binding fields
@@ -323,7 +323,7 @@ impl SDJWTHolder {
         );
 
         header.typ = Some(crate::KB_JWT_TYP_HEADER.into());
-        self.serialized_key_binding_jwt = encode(&header, &self.key_binding_jwt_payload, &*signer).await?;
+        self.serialized_key_binding_jwt = encode(&header, &self.key_binding_jwt_payload, &signer).await?;
         Ok(())
     }
 
@@ -380,7 +380,7 @@ mod tests {
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
             None
         );
-        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
@@ -394,7 +394,7 @@ mod tests {
             SDJWTSerializationFormat::Compact,
         )
             .unwrap()
-            .create_presentation(
+            .create_presentation::<SDJWTKey>(
                 user_claims.as_object().unwrap().clone(),
                 None,
                 None,
@@ -425,7 +425,7 @@ mod tests {
             None
         );
 
-        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
@@ -439,7 +439,7 @@ mod tests {
         let presentation =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation::<SDJWTKey>(
                     user_claims.as_object().unwrap().clone(),
                     None,
                     None,
@@ -498,7 +498,7 @@ mod tests {
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
             None
         );
-        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             strategy,
             None,
@@ -516,7 +516,7 @@ mod tests {
         let presentation =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation::<SDJWTKey>(
                     user_claims.as_object().unwrap().clone(),
                     None,
                     None,
@@ -638,7 +638,7 @@ mod tests {
         let presentation =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation::<SDJWTKey>(
                     revealed.as_object().unwrap().clone(),
                     None,
                     None,
@@ -684,7 +684,7 @@ mod tests {
         let holder_key = EncodingKey::from_ec_pem(private_holder_bytes).unwrap();
         let holder_public_jwk = serde_json::from_value(PUBLIC_HOLDER_JWK.parse().unwrap()).unwrap();
 
-        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             Some(holder_public_jwk),
@@ -701,7 +701,7 @@ mod tests {
                     user_claims.as_object().unwrap().clone(),
                     Some("1".to_string()),
                     Some("https://example.com/aud".to_string()),
-                    Some(Box::new(SDJWTKey::new(holder_key, None))),
+                    Some(SDJWTKey::new(holder_key, None)),
                 )
                 .await.unwrap();
 
