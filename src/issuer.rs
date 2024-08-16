@@ -20,13 +20,13 @@ use crate::{
 };
 use crate::signer::SDJWTSigner;
 
-pub struct SDJWTIssuer {
+pub struct SDJWTIssuer<S: SDJWTSigner> {
     // parameters
     add_decoy_claims: bool,
     extra_header_parameters: Option<HashMap<String, String>>,
 
     // input data
-    signer: Box<dyn SDJWTSigner>,
+    signer: S,
     holder_key: Option<Jwk>,
 
     // internal fields
@@ -84,11 +84,11 @@ impl<'a> ClaimsForSelectiveDisclosureStrategy<'a> {
                     .iter()
                     .filter_map(|str| {
                         str.strip_prefix(key).and_then(|str|
-                            match str.chars().next() {
-                                Some('.') => Some(&str[1..]), // next token
-                                Some('[') => Some(str),       // array index
-                                _ => None,
-                            }
+                        match str.chars().next() {
+                            Some('.') => Some(&str[1..]), // next token
+                            Some('[') => Some(str),       // array index
+                            _ => None,
+                        }
                         )
                     })
                     .collect();
@@ -107,7 +107,7 @@ impl<'a> ClaimsForSelectiveDisclosureStrategy<'a> {
     }
 }
 
-impl SDJWTIssuer {
+impl <S: SDJWTSigner> SDJWTIssuer<S> {
     const DECOY_MIN_ELEMENTS: u32 = 2;
     const DECOY_MAX_ELEMENTS: u32 = 5;
 
@@ -121,7 +121,7 @@ impl SDJWTIssuer {
     ///
     /// # Returns
     /// A new SDJWTIssuer instance.
-    pub fn new(signer: Box<dyn SDJWTSigner>) -> Self {
+    pub fn new(signer: S) -> Self {
         SDJWTIssuer {
             add_decoy_claims: false,
             extra_header_parameters: None,
@@ -320,7 +320,7 @@ impl SDJWTIssuer {
             }
         }
 
-        self.signed_sd_jwt = encode(&header, &self.sd_jwt_payload, &*self.signer).await?;
+        self.signed_sd_jwt = encode(&header, &self.sd_jwt_payload, &self.signer).await?;
 
         Ok(())
     }
@@ -406,9 +406,9 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
-        let sd_jwt = SDJWTIssuer::new(Box::new(issuer_key)).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims,
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
@@ -454,7 +454,7 @@ mod tests {
             "street_address",
             "locality",
             "region",
-            "country"
+            "country",
         ]));
     }
 }
