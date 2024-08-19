@@ -1,8 +1,9 @@
 use std::str::FromStr;
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, crypto, EncodingKey};
+use jsonwebtoken::{Algorithm, crypto, DecodingKey, EncodingKey, Header};
 use crate::DEFAULT_SIGNING_ALG;
 use crate::error::{ Error, Result};
+use crate::resolver::KeyResolver;
 use crate::signer::SDJWTSigner;
 
 pub struct SDJWTKey {
@@ -41,5 +42,20 @@ impl SDJWTSigner for SDJWTKey {
 
         crypto::sign(message, &self.private_key, algorithm)
             .map_err(|e| Error::SigningError(e.to_string()))
+    }
+}
+
+pub struct SDJWTPubKey(DecodingKey);
+
+#[async_trait]
+impl KeyResolver for SDJWTPubKey {
+    async fn resolve(&self, _: &str, _: &Header) -> Result<DecodingKey> {
+        Ok(self.0.clone())
+    }
+}
+
+impl From<DecodingKey> for SDJWTPubKey {
+    fn from(value: DecodingKey) -> Self {
+        SDJWTPubKey(value)
     }
 }

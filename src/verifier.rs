@@ -2,73 +2,75 @@ use crate::SDJWTSerializationFormat;
 use crate::error::Error;
 use crate::error::Result;
 use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
-use log::debug;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{Map, Value};
 use std::option::Option;
 use std::str::FromStr;
 use std::string::String;
 use std::vec::Vec;
-
 use crate::utils::base64_hash;
 use crate::{
-    SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
-    DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER, SD_DIGESTS_KEY,
-    SD_LIST_PREFIX,
+    SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+    DEFAULT_SIGNING_ALG, JWK_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER,
 };
-
-type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
+use crate::resolver::KeyResolver;
 
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
-
     sd_jwt_payload: Map<String, Value>,
     _holder_public_key_payload: Option<Map<String, Value>>,
-    duplicate_hash_check: Vec<String>,
-    pub verified_claims: Value,
-
-    cb_get_issuer_key: Box<KeyResolver>,
+    issuer_key_resolver: Box<dyn KeyResolver>,
 }
 
 impl SDJWTVerifier {
-    /// Create a new SDJWTVerifier instance.
+    /// Creates a new `SDJWTVerifier` instance.
+    ///
+    /// # Arguments
+    /// * `issuer_key_resolver` - A key resolver that resolves the public key of the issuer.
+    ///
+    /// # Returns
+    /// * `SDJWTVerifier` - The `SDJWTVerifier` instance.
+    pub fn new(issuer_key_resolver: Box<dyn KeyResolver>) -> Self {
+        SDJWTVerifier {
+            sd_jwt_payload: Default::default(),
+            _holder_public_key_payload: None,
+            issuer_key_resolver,
+            sd_jwt_engine: Default::default(),
+        }
+    }
+
+    /// Verifies the SD-JWT presentation.
     ///
     /// # Arguments
     /// * `sd_jwt_presentation` - The SD-JWT presentation to verify.
-    /// * `cb_get_issuer_key` - A callback function that takes the issuer and the header of the SD-JWT and returns the public key of the issuer.
-    /// * `expected_aud` - The expected audience of the SD-JWT.
-    /// * `expected_nonce` - The expected nonce of the SD-JWT.
-    /// * `serialization_format` - The serialization format of the SD-JWT, see [SDJWTSerializationFormat].
+    /// * `expected_aud` - The expected audience of the SD-JWT, if any.
+    /// * `expected_nonce` - The expected nonce of the SD-JWT, if any.
+    /// * `serialization_format` - The serialization format of the SD-JWT, see [`SDJWTSerializationFormat`].
     ///
     /// # Returns
-    /// * `SDJWTVerifier` - The SDJWTVerifier instance. The verified claims can be accessed via the `verified_claims` property.
-    pub fn new(
+    /// * `Result<Value>` - The verified claims as a JSON value
+    pub async fn verify_presentation(
+        &mut self,
         sd_jwt_presentation: String,
-        cb_get_issuer_key: Box<KeyResolver>,
         expected_aud: Option<String>,
         expected_nonce: Option<String>,
         serialization_format: SDJWTSerializationFormat,
-    ) -> Result<Self> {
-        let mut verifier = SDJWTVerifier {
-            sd_jwt_payload: serde_json::Map::new(),
-            _holder_public_key_payload: None,
-            duplicate_hash_check: Vec::new(),
-            cb_get_issuer_key,
-            sd_jwt_engine: SDJWTCommon {
-                serialization_format,
-                ..Default::default()
-            },
-            verified_claims: Value::Null,
+    ) -> Result<Value> {
+        let sd_jwt_engine = SDJWTCommon {
+            serialization_format,
+            ..Default::default()
         };
 
-        verifier.sd_jwt_engine.parse_sd_jwt(sd_jwt_presentation)?;
-        verifier.sd_jwt_engine.create_hash_mappings()?;
-        let sign_alg = verifier.sd_jwt_engine.sign_alg.clone();
-        verifier.verify_sd_jwt(sign_alg.clone())?;
-        verifier.verified_claims = verifier.extract_sd_claims()?;
+        self.reset();
+        self.sd_jwt_engine = sd_jwt_engine;
+
+        self.sd_jwt_engine.parse_sd_jwt(sd_jwt_presentation)?;
+        self.sd_jwt_engine.create_hash_mappings()?;
+        let sign_alg = self.sd_jwt_engine.sign_alg.clone();
+        self.verify_sd_jwt(sign_alg.clone()).await?;
 
         if let (Some(expected_aud), Some(expected_nonce)) = (&expected_aud, &expected_nonce) {
-            verifier.verify_key_binding_jwt(
+            self.verify_key_binding_jwt(
                 expected_aud.to_owned(),
                 expected_nonce.to_owned(),
                 sign_alg.as_deref(),
@@ -80,10 +82,15 @@ impl SDJWTVerifier {
             ));
         }
 
-        Ok(verifier)
+        self.sd_jwt_engine.extract_sd_claims(&self.sd_jwt_payload)
     }
 
-    fn verify_sd_jwt(&mut self, sign_alg: Option<String>) -> Result<()> {
+    fn reset(&mut self) {
+        self.sd_jwt_payload = Default::default();
+        self._holder_public_key_payload = None;
+    }
+
+    async fn verify_sd_jwt(&mut self, sign_alg: Option<String>) -> Result<()> {
         let sd_jwt = self
             .sd_jwt_engine
             .unverified_sd_jwt
@@ -99,7 +106,9 @@ impl SDJWTVerifier {
             .ok_or(Error::ConversionError("reference".to_string()))?["iss"]
             .as_str()
             .ok_or(Error::ConversionError("str".to_string()))?;
-        let issuer_public_key = (self.cb_get_issuer_key)(unverified_issuer, &parsed_header_sd_jwt);
+        let issuer_public_key = self.issuer_key_resolver
+            .resolve(unverified_issuer, &parsed_header_sd_jwt)
+            .await?;
         let algorithm: Algorithm = match sign_alg {
             Some(alg_str) => Algorithm::from_str(&alg_str)
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
@@ -217,159 +226,6 @@ impl SDJWTVerifier {
 
         Ok(base64_hash(combined.as_bytes()))
     }
-
-    fn extract_sd_claims(&mut self) -> Result<Value> {
-        if self.sd_jwt_payload.contains_key(DIGEST_ALG_KEY)
-            && self.sd_jwt_payload[DIGEST_ALG_KEY] != DEFAULT_DIGEST_ALG
-        {
-            return Err(Error::DeserializationError(format!(
-                "Invalid hash algorithm {}",
-                self.sd_jwt_payload[DIGEST_ALG_KEY]
-            )));
-        }
-
-        self.duplicate_hash_check = Vec::new();
-        let claims: Value = self.sd_jwt_payload.clone().into_iter().collect();
-        self.unpack_disclosed_claims(&claims)
-    }
-
-    fn unpack_disclosed_claims(&mut self, sd_jwt_claims: &Value) -> Result<Value> {
-        match sd_jwt_claims {
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                Ok(sd_jwt_claims.to_owned())
-            }
-            Value::Array(arr) => {
-                self.unpack_disclosed_claims_in_array(arr)
-            }
-            Value::Object(obj) => {
-                self.unpack_disclosed_claims_in_object(obj)
-            }
-        }
-    }
-
-    fn unpack_disclosed_claims_in_array(&mut self, arr: &Vec<Value>) -> Result<Value> {
-        if arr.is_empty() {
-            return Err(Error::InvalidArrayDisclosureObject(
-                "Array of disclosed claims cannot be empty".to_string(),
-            ));
-        }
-
-        let mut claims = vec![];
-        for value in arr {
-
-            match value {
-                // case for SD objects in arrays
-                Value::Object(obj) if obj.contains_key(SD_LIST_PREFIX) => {
-                    if obj.len() > 1 {
-                        return Err(Error::InvalidDisclosure(
-                            "Disclosed claim object in an array maust contain only one key".to_string(),
-                        ));
-                    }
-
-                    let digest = obj.get(SD_LIST_PREFIX).unwrap();
-                    let disclosed_claim = self.unpack_from_digest(digest)?;
-                    if let Some(disclosed_claim) = disclosed_claim {
-                        claims.push(disclosed_claim);
-                    }
-                },
-                _ => {
-                    let claim = self.unpack_disclosed_claims(value)?;
-                    claims.push(claim);
-                },
-            }
-        }
-        Ok(Value::Array(claims))
-    }
-
-    fn unpack_disclosed_claims_in_object(&mut self, nested_sd_jwt_claims: &Map<String, Value>) -> Result<Value> {
-        let mut disclosed_claims: Map<String, Value> = serde_json::Map::new();
-
-        for (key, value) in nested_sd_jwt_claims {
-            if key != SD_DIGESTS_KEY && key != DIGEST_ALG_KEY {
-                disclosed_claims.insert(key.to_owned(), self.unpack_disclosed_claims(value)?);
-            }
-        }
-
-        if let Some(Value::Array(digest_of_disclosures)) = nested_sd_jwt_claims.get(SD_DIGESTS_KEY)
-        {
-            self.unpack_from_digests(&mut disclosed_claims, digest_of_disclosures)?;
-        }
-
-        Ok(Value::Object(disclosed_claims))
-    }
-
-    fn unpack_from_digests(
-        &mut self,
-        pre_output: &mut Map<String, Value>,
-        digests_of_disclosures: &Vec<Value>,
-    ) -> Result<()> {
-        for digest in digests_of_disclosures {
-            let digest = digest
-                .as_str()
-                .ok_or(Error::ConversionError("str".to_string()))?;
-            if self.duplicate_hash_check.contains(&digest.to_string()) {
-                return Err(Error::DuplicateDigestError(digest.to_string()));
-            }
-            self.duplicate_hash_check.push(digest.to_string());
-
-            if let Some(value_for_digest) =
-                self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)
-            {
-                let disclosure =
-                    value_for_digest
-                        .as_array()
-                        .ok_or(Error::InvalidArrayDisclosureObject(
-                            value_for_digest.to_string(),
-                        ))?;
-                let key = disclosure[1]
-                    .as_str()
-                    .ok_or(Error::ConversionError("str".to_string()))?
-                    .to_owned();
-                let value = disclosure[2].clone();
-                if pre_output.contains_key(&key) {
-                    return Err(Error::DuplicateKeyError(key.to_string()));
-                }
-                let unpacked_value = self.unpack_disclosed_claims(&value)?;
-                pre_output.insert(key, unpacked_value);
-            } else {
-                debug!("Digest {:?} skipped as decoy", digest)
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unpack_from_digest(
-        &mut self,
-        digest: &Value,
-    ) -> Result<Option<Value>> {
-        let digest = digest
-            .as_str()
-            .ok_or(Error::ConversionError("str".to_string()))?;
-        if self.duplicate_hash_check.contains(&digest.to_string()) {
-            return Err(Error::DuplicateDigestError(digest.to_string()));
-        }
-        self.duplicate_hash_check.push(digest.to_string());
-
-        if let Some(value_for_digest) =
-            self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)
-        {
-            let disclosure =
-                value_for_digest
-                    .as_array()
-                    .ok_or(Error::InvalidArrayDisclosureObject(
-                        value_for_digest.to_string(),
-                    ))?;
-
-            let value = disclosure[1].clone();
-            let unpacked_value = self.unpack_disclosed_claims(&value)?;
-            return Ok(Some(unpacked_value));
-        } else {
-            debug!("Digest {:?} skipped as decoy", digest)
-        }
-
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -379,7 +235,7 @@ mod tests {
     use crate::{SDJWTHolder, SDJWTIssuer, SDJWTVerifier, SDJWTSerializationFormat};
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use serde_json::{json, Value};
-    use crate::key::SDJWTKey;
+    use crate::key::{ SDJWTKey, SDJWTPubKey };
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
     const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
@@ -424,18 +280,14 @@ mod tests {
             )
             .await.unwrap();
         assert_eq!(sd_jwt, presentation);
-        let verified_claims = SDJWTVerifier::new(
-            presentation,
-            Box::new(|_, _| {
-                let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-                DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-            }),
-            None,
-            None,
-            SDJWTSerializationFormat::Compact,
-        )
-            .unwrap()
-            .verified_claims;
+
+        let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
+            .await
+            .unwrap();
         assert_eq!(user_claims, verified_claims);
 
         Ok(())
@@ -480,18 +332,14 @@ mod tests {
             )
             .await.unwrap();
         assert_eq!(sd_jwt, presentation);
-        let verified_claims = SDJWTVerifier::new(
-            presentation,
-            Box::new(|_, _| {
-                let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-                DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-            }),
-            None,
-            None,
-            SDJWTSerializationFormat::Compact,
-        )
-            .unwrap()
-            .verified_claims;
+
+        let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
+            .await
+            .unwrap();
         assert_eq!(user_claims, verified_claims);
 
         Ok(())
@@ -561,18 +409,13 @@ mod tests {
             )
             .await.unwrap();
 
-        let verified_claims = SDJWTVerifier::new(
-            presentation.clone(),
-            Box::new(|_, _| {
-                let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-                DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-            }),
-            None,
-            None,
-            SDJWTSerializationFormat::Compact,
-        )
-            .unwrap()
-            .verified_claims;
+        let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
+            .await
+            .unwrap();
 
         let expected_verified_claims = json!(
             {
@@ -661,18 +504,13 @@ mod tests {
             )
             .await.unwrap();
 
-        let verified_claims = SDJWTVerifier::new(
-            presentation.clone(),
-            Box::new(|_, _| {
-                let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-                DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-            }),
-            None,
-            None,
-            SDJWTSerializationFormat::Compact,
-        )
-            .unwrap()
-            .verified_claims;
+        let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
+            .await
+            .unwrap();
 
         let expected_verified_claims = json!(
             {
@@ -732,18 +570,14 @@ mod tests {
             )
             .await.unwrap();
         assert_eq!(sd_jwt, presentation);
-        let verified_claims = SDJWTVerifier::new(
-            presentation,
-            Box::new(|_, _| {
-                let public_issuer_bytes = PUBLIC_ISSUER_ED25519_PEM.as_bytes();
-                DecodingKey::from_ed_pem(public_issuer_bytes).unwrap()
-            }),
-            None,
-            None,
-            SDJWTSerializationFormat::JSON, // Changed to Json format
-        )
-            .unwrap()
-            .verified_claims;
+
+        let public_issuer_bytes = PUBLIC_ISSUER_ED25519_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ed_pem(public_issuer_bytes).unwrap().into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(presentation, None, None, SDJWTSerializationFormat::JSON)
+            .await
+            .unwrap();
         assert_eq!(user_claims, verified_claims);
 
         Ok(())
