@@ -1,3 +1,4 @@
+use std::ops::Add;
 use crate::SDJWTSerializationFormat;
 use crate::error::Error;
 use crate::error::Result;
@@ -70,6 +71,12 @@ impl SDJWTVerifier {
         self.verify_sd_jwt(sign_alg.clone()).await?;
 
         if let (Some(expected_aud), Some(expected_nonce)) = (&expected_aud, &expected_nonce) {
+            let sign_alg = self.sd_jwt_engine.unverified_input_key_binding_jwt
+                .as_ref()
+                .and_then(|value| {
+                    SDJWTCommon::decode_header_and_get_sign_algorithm(&value)
+                });
+
             self.verify_key_binding_jwt(
                 expected_aud.to_owned(),
                 expected_nonce.to_owned(),
@@ -222,7 +229,9 @@ impl SDJWTVerifier {
                 .iter()
                 .map(|s| s.as_str()),
         );
-        let combined = combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
+        let combined = combined
+            .join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .add(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
 
         Ok(base64_hash(combined.as_bytes()))
     }
@@ -241,6 +250,16 @@ mod tests {
     const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
     const PRIVATE_ISSUER_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMFECAQEwBQYDK2VwBCIEIF93k6rxZ8W38cm0rOwfGdH+YY3k10hP+7gd0falPLg0\ngSEAdW31QyWzfed4EPcw1rYuUa1QU+fXEL0HhdAfYZRkihc=\n-----END PRIVATE KEY-----\n";
     const PUBLIC_ISSUER_ED25519_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAdW31QyWzfed4EPcw1rYuUa1QU+fXEL0HhdAfYZRkihc=\n-----END PUBLIC KEY-----\n";
+
+    const HOLDER_KEY_ED25519: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIOeIDnHHMoPCUTiq206gR+FdCdNtc31SzF1nKX31hvhd\n-----END PRIVATE KEY-----";
+
+    const HOLDER_JWK_KEY_ED25519: &str = r#"{
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kid": "52128f2e-900e-414e-81c3-0b5f86f0f7b3",
+        "kty": "OKP",
+        "x": "24QLWXJ18wtbg3k_MDGhGM17Xh39UftuxbwJZzRLzkA"
+    }"#;
 
     #[async_test]
     async fn verify_full_presentation() -> std::io::Result<()> {
@@ -559,7 +578,7 @@ mod tests {
             None,
         )
         .await.unwrap();
-       
+
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON) // Changed to Json format
             .unwrap()
             .create_presentation::<SDJWTKey>(
@@ -579,6 +598,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(user_claims, verified_claims);
+
+        Ok(())
+    }
+    #[async_test]
+    async fn verify_presentation_when_sd_jwt_uses_es256_and_key_binding_uses_eddsa() -> std::io::Result<()> {
+        let user_claims = json!({
+            "address": {
+                "street_address": "Schulstr. 12",
+                "locality": "Schulpforta",
+                "region": "Sachsen-Anhalt",
+                "country": "DE"
+            },
+            "exp": 1883000000,
+            "iat": 1683000000,
+            "iss": "https://example.com/issuer",
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+
+        });
+
+        let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            Some("ES256".to_string()),
+        );
+
+        let mut issuer = SDJWTIssuer::new(issuer_key);
+        let sd_jwt = issuer
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                Some(serde_json::from_str(HOLDER_JWK_KEY_ED25519).unwrap()),
+                false,
+                SDJWTSerializationFormat::JSON,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let private_holder_bytes = HOLDER_KEY_ED25519.as_bytes();
+        let holder_key = EncodingKey::from_ed_pem(private_holder_bytes).unwrap();
+
+        let nonce = Some(String::from("testNonce"));
+        let aud = Some(String::from("testAud"));
+
+        let mut holder = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON).unwrap(); // Changed to Json format
+        let presentation = holder
+            .create_presentation(
+                user_claims.as_object().unwrap().clone(),
+                nonce.clone(),
+                aud.clone(),
+                Some(SDJWTKey::new(holder_key, Some("EdDSA".to_string()))),
+            )
+            .await
+            .unwrap();
+
+        let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+            .unwrap()
+            .into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(
+                presentation,
+                aud.clone(),
+                nonce.clone(),
+                SDJWTSerializationFormat::JSON,
+            )
+            .await
+            .unwrap();
+
+        let claims_to_check = json!({
+            "iss": user_claims["iss"].clone(),
+            "iat": user_claims["iat"].clone(),
+            "exp": user_claims["exp"].clone(),
+            "cnf": {
+                "jwk": serde_json::from_str::<Value>(HOLDER_JWK_KEY_ED25519).unwrap(),
+            },
+            "sub": user_claims["sub"].clone(),
+            "address": user_claims["address"].clone(),
+        });
+
+        assert_eq!(claims_to_check, verified_claims);
 
         Ok(())
     }

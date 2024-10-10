@@ -1,3 +1,7 @@
+// Copyright (c) 2024 DSR Corporation, Denver, Colorado.
+// https://www.dsr-corporation.com
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::utils::fixtures::{
     ADDRESS_CLAIMS, ADDRESS_ONLY_STRUCTURED_JSONPATH, ADDRESS_ONLY_STRUCTURED_ONE_OPEN_JSONPATH,
     ARRAYED_CLAIMS, ARRAYED_CLAIMS_JSONPATH, COMPLEX_EIDAS_CLAIMS, COMPLEX_EIDAS_JSONPATH,
@@ -12,7 +16,7 @@ use sd_jwt_rs::{SDJWTHolder, SDJWTIssuer, SDJWTJson, SDJWTVerifier, SDJWTSeriali
 use sd_jwt_rs::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use sd_jwt_rs::key::SDJWTKey;
+use sd_jwt_rs::key::{SDJWTKey, SDJWTPubKey};
 
 mod utils;
 
@@ -370,16 +374,14 @@ async fn demo_positive_cases(
         assert_eq!(revealed, issued);
     }
 
+    let public_issuer_bytes = ISSUER_PUBLIC_KEY.as_bytes();
+    let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+        .unwrap()
+        .into();
+
     // Verify presentation
-    let _verified = SDJWTVerifier::new(
-        presentation.clone(),
-        Box::new(|_, _| {
-            let public_issuer_bytes = ISSUER_PUBLIC_KEY.as_bytes();
-            DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-        }),
-        aud,
-        nonce,
-        format,
-    )
+    let _verified = SDJWTVerifier::new(Box::new(issuer_pub_key))
+        .verify_presentation(presentation, aud, nonce, format)
+        .await
         .unwrap();
 }
