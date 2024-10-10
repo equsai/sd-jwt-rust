@@ -578,7 +578,7 @@ mod tests {
             None,
         )
         .await.unwrap();
-       
+
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON) // Changed to Json format
             .unwrap()
             .create_presentation::<SDJWTKey>(
@@ -601,9 +601,8 @@ mod tests {
 
         Ok(())
     }
-    #[test]
-    fn verify_presentation_when_sd_jwt_uses_es256_and_key_binding_uses_eddsa() {
-
+    #[async_test]
+    async fn verify_presentation_when_sd_jwt_uses_es256_and_key_binding_uses_eddsa() -> std::io::Result<()> {
         let user_claims = json!({
             "address": {
                 "street_address": "Schulstr. 12",
@@ -619,17 +618,23 @@ mod tests {
         });
 
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            Some("ES256".to_string()),
+        );
 
-        let mut issuer = SDJWTIssuer::new(issuer_key, Some("ES256".to_string()));
-
-        let sd_jwt = issuer.issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
-            Some(serde_json::from_str(HOLDER_JWK_KEY_ED25519).unwrap()),
-            false,
-            SDJWTSerializationFormat::JSON, // Changed to Json format
-        ).unwrap();
+        let mut issuer = SDJWTIssuer::new(issuer_key);
+        let sd_jwt = issuer
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                Some(serde_json::from_str(HOLDER_JWK_KEY_ED25519).unwrap()),
+                false,
+                SDJWTSerializationFormat::JSON,
+                None,
+            )
+            .await
+            .unwrap();
 
         let private_holder_bytes = HOLDER_KEY_ED25519.as_bytes();
         let holder_key = EncodingKey::from_ed_pem(private_holder_bytes).unwrap();
@@ -638,26 +643,30 @@ mod tests {
         let aud = Some(String::from("testAud"));
 
         let mut holder = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON).unwrap(); // Changed to Json format
-        let presentation = holder.create_presentation(
+        let presentation = holder
+            .create_presentation(
                 user_claims.as_object().unwrap().clone(),
                 nonce.clone(),
                 aud.clone(),
-                Some(holder_key),
-                Some("EdDSA".to_string())
+                Some(SDJWTKey::new(holder_key, Some("EdDSA".to_string()))),
             )
+            .await
             .unwrap();
-        let verified_claims = SDJWTVerifier::new(
-            presentation,
-            Box::new(|_, _| {
-                let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-                DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-            }),
-            aud.clone(),
-            nonce.clone(),
-            SDJWTSerializationFormat::JSON, // Changed to Json format
-        )
+
+        let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
             .unwrap()
-            .verified_claims;
+            .into();
+
+        let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(
+                presentation,
+                aud.clone(),
+                nonce.clone(),
+                SDJWTSerializationFormat::JSON,
+            )
+            .await
+            .unwrap();
 
         let claims_to_check = json!({
             "iss": user_claims["iss"].clone(),
@@ -671,5 +680,7 @@ mod tests {
         });
 
         assert_eq!(claims_to_check, verified_claims);
+
+        Ok(())
     }
 }
