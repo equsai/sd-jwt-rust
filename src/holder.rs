@@ -459,10 +459,11 @@ mod tests {
         let mut parts: Vec<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
+
+        parts.remove(6);
         parts.remove(5);
         parts.remove(4);
         parts.remove(3);
-        parts.remove(2);
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
 
@@ -832,10 +833,10 @@ mod tests {
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
 
+        parts.remove(6);
         parts.remove(5);
         parts.remove(4);
         parts.remove(3);
-        parts.remove(2);
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
 
