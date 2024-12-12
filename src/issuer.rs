@@ -24,6 +24,8 @@ use crate::{
 };
 use crate::signer::SDJWTSigner;
 
+const ALWAYS_REVEALED_ROOT_KEYS: [&str; 4] = ["iss", "exp", "nbf", "aud"];
+
 pub struct SDJWTIssuer<S: SDJWTSigner> {
     // parameters
     add_decoy_claims: bool,
@@ -197,8 +199,7 @@ impl <S: SDJWTSigner> SDJWTIssuer<S> {
         let claims_obj_ref = user_claims
             .as_object_mut()
             .ok_or(Error::ConversionError("json object".to_string()))?;
-        let always_revealed_root_keys = vec!["iss", "iat", "exp"];
-        let mut always_revealed_claims: Map<String, Value> = always_revealed_root_keys
+        let mut always_revealed_claims: Map<String, Value> = ALWAYS_REVEALED_ROOT_KEYS
             .into_iter()
             .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
             .collect();
