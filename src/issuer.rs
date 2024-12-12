@@ -24,7 +24,7 @@ use crate::{
 };
 use crate::signer::SDJWTSigner;
 
-const ALWAYS_REVEALED_ROOT_KEYS: [&str; 2] = ["iss", "exp"];
+const ALWAYS_REVEALED_ROOT_KEYS: [&str; 4] = ["iss", "exp", "nbf", "aud"];
 
 pub struct SDJWTIssuer<S: SDJWTSigner> {
     // parameters
