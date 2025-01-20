@@ -504,7 +504,7 @@ mod tests {
         user_claims["username"] = Value::Bool(true);
         user_claims["email"] = Value::Object(serde_json::Map::from_iter([("work".to_string(), Value::Bool(true))]));
 
-        let presentation =
+        let _ =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
                 .create_presentation::<SDJWTKey>(
