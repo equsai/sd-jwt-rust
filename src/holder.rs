@@ -205,7 +205,8 @@ impl SDJWTHolder {
                     {
                         next
                     } else {
-                        sd_map[key_to_disclose.as_str()]
+                        sd_map.get(key_to_disclose.as_str())
+                            .ok_or(Error::KeyNotFound(format!("Disclosure with key = '{}' is not found", key_to_disclose.to_string())))?
                             .0
                             .as_object()
                             .ok_or(Error::ConversionError("json object".to_string()))?
@@ -467,6 +468,52 @@ mod tests {
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
 
+        Ok(())
+    }
+
+    #[async_test]
+    #[should_panic(expected = "Disclosure with key = 'email' is not found")]
+    async fn create_presentation_with_non_existing_key_in_disclosures() -> std::io::Result<()> {
+        let mut user_claims = json!({
+            "birthdate": ["1955-04-12"],
+            "family_name": "Neal",
+            "given_name": "Tyler",
+            "username": "tneal",
+            "email": "tyler.neal@example.com",
+            "iss": "did:key:zDnaeWEtv3fqyb8tTY7NGysY8RavUrhYtFe6qd9eddRWkSDFw",
+            "iat": 1730118723,
+            "exp": 1761654723,
+        });
+        let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
+            user_claims.clone(),
+            ClaimsForSelectiveDisclosureStrategy::Custom(vec!["$.given_name", "$.family_name", "$.username", "$.email.work"]),
+            None,
+            false,
+            SDJWTSerializationFormat::Compact,
+            None
+        )
+            .await.unwrap();
+        // Choose what to reveal
+        user_claims["given_name"] = Value::Bool(true);
+        user_claims["family_name"] = Value::Bool(true);
+        user_claims["username"] = Value::Bool(true);
+        user_claims["email"] = Value::Object(serde_json::Map::from_iter([("work".to_string(), Value::Bool(true))]));
+
+        let _ =
+            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+                .unwrap()
+                .create_presentation::<SDJWTKey>(
+                    user_claims.as_object().unwrap().clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await.unwrap();
         Ok(())
     }
 
