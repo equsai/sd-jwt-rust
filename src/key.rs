@@ -47,6 +47,7 @@ impl SDJWTSigner for SDJWTKey {
 
 pub struct SDJWTPubKey(DecodingKey);
 
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[async_trait]
 impl KeyResolver for SDJWTPubKey {
     async fn resolve(&self, _: &str, _: &Header) -> Result<DecodingKey> {
