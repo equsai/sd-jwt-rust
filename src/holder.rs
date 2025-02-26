@@ -9,7 +9,6 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::str::FromStr;
-use std::time;
 use crate::utils::{base64_hash, encode};
 use crate::SDJWTCommon;
 use crate::{
@@ -316,10 +315,7 @@ impl SDJWTHolder {
             .insert("nonce".to_string(), nonce.into());
         self.key_binding_jwt_payload
             .insert("aud".to_string(), aud.into());
-        let timestamp = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .map_err(|e| Error::ConversionError(format!("timestamp: {}", e)))?
-            .as_secs();
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
         self.key_binding_jwt_payload
             .insert("iat".to_string(), timestamp.into());
         self.set_key_binding_digest_key()?;
