@@ -28,7 +28,8 @@ impl SDJWTKey {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SDJWTSigner for SDJWTKey {
     /// Description. See [SDJWTSigner::algorithm] for further information.
     fn algorithm(&self) -> &str {
@@ -48,7 +49,7 @@ impl SDJWTSigner for SDJWTKey {
 pub struct SDJWTPubKey(DecodingKey);
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl KeyResolver for SDJWTPubKey {
     async fn resolve(&self, _: &str, _: &Header) -> Result<DecodingKey> {
         Ok(self.0.clone())
