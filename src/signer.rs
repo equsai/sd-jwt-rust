@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use crate::error::Result;
+use crate::utils::{WasmNotSend, WasmNotSync};
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait SDJWTSigner: Sync + Send {
+pub trait SDJWTSigner: WasmNotSync + WasmNotSend {
     /// Return the source algorithm.
     fn algorithm(&self) -> &str;
 
