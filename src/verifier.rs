@@ -121,10 +121,13 @@ impl SDJWTVerifier {
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
             None => Algorithm::ES256, // Default or handle as needed
         };
+        let mut validation = Validation::new(algorithm);
+        // exp claim is required by library but is optional according to the spec (https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1.4)
+        validation.required_spec_claims.remove("exp");
         let claims = jsonwebtoken::decode(
             sd_jwt,
             &issuer_public_key,
-            &Validation::new(algorithm),
+            &validation,
         )
             .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {}", e)))?
             .claims;
