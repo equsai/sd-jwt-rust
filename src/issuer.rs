@@ -162,14 +162,44 @@ impl SDJWTIssuer {
     pub fn issue_sd_jwt(
         &mut self,
         user_claims: Value,
-        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy,
+        sd_strategy: ClaimsForSelectiveDisclosureStrategy,
         holder_key: Option<Jwk>,
         add_decoy_claims: bool,
         serialization_format: SDJWTSerializationFormat,
         // extra_header_parameters: Option<HashMap<String, String>>,
     ) -> Result<String> {
+        self.issue_sd_jwt_with_overrides(
+            user_claims,
+            sd_strategy,
+            holder_key,
+            add_decoy_claims,
+            serialization_format,
+            None,
+            SJMap::new(),
+        )
+    }
+
+    /// Crate-internal entry point used by [`crate::holder::SDJWTHolder::delegate`] to
+    /// produce the KB-SD-JWT link of a delegation chain.
+    ///
+    /// Behaves like [`Self::issue_sd_jwt`] plus:
+    /// * `typ_header` — overrides the JWS `typ` (e.g. `kb+sd-jwt`, `kb+sd-jwt+kb`).
+    /// * `extra_always_revealed` — claims merged into the signed payload after the
+    ///   SD strategy runs, ensuring they appear in cleartext (used for `sd_hash` /
+    ///   `issuer_jwt_hash` chain-binding claims).
+    pub(crate) fn issue_sd_jwt_with_overrides(
+        &mut self,
+        user_claims: Value,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy,
+        holder_key: Option<Jwk>,
+        add_decoy_claims: bool,
+        serialization_format: SDJWTSerializationFormat,
+        typ_header: Option<String>,
+        extra_always_revealed: SJMap<String, Value>,
+    ) -> Result<String> {
         let inner = SDJWTCommon {
             serialization_format,
+            typ: typ_header,
             ..Default::default()
         };
 
@@ -183,6 +213,9 @@ impl SDJWTIssuer {
         self.add_decoy_claims = add_decoy_claims;
 
         self.assemble_sd_jwt_payload(user_claims, sd_strategy)?;
+        for (k, v) in extra_always_revealed {
+            self.sd_jwt_payload.insert(k, v);
+        }
         self.create_signed_jws()?;
         self.create_combined()?;
 

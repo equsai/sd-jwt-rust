@@ -10,8 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use strum::Display;
 use std::collections::HashMap;
-pub use {holder::SDJWTHolder, issuer::SDJWTIssuer, issuer::ClaimsForSelectiveDisclosureStrategy, verifier::SDJWTVerifier};
+pub use {
+    delegate::ChainBindingMode, holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy,
+    issuer::SDJWTIssuer, verifier::SDJWTVerifier,
+};
 
+pub(crate) mod delegate;
 mod disclosure;
 pub mod error;
 pub mod holder;
@@ -20,17 +24,25 @@ pub mod utils;
 pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
-const SD_DIGESTS_KEY: &str = "_sd";
-const DIGEST_ALG_KEY: &str = "_sd_alg";
+pub(crate) const SD_DIGESTS_KEY: &str = "_sd";
+pub(crate) const DIGEST_ALG_KEY: &str = "_sd_alg";
 pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
-const SD_LIST_PREFIX: &str = "...";
+pub(crate) const SD_LIST_PREFIX: &str = "...";
 const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
-const KB_JWT_TYP_HEADER: &str = "kb+jwt";
-const KB_DIGEST_KEY: &str = "sd_hash";
+pub(crate) const KB_JWT_TYP_HEADER: &str = "kb+jwt";
+pub(crate) const KB_SD_JWT_TYP_HEADER: &str = "kb+sd-jwt";
+pub(crate) const KB_SD_JWT_KB_TYP_HEADER: &str = "kb+sd-jwt+kb";
+pub(crate) const KB_DIGEST_KEY: &str = "sd_hash";
+pub(crate) const ISSUER_JWT_HASH_KEY: &str = "issuer_jwt_hash";
+pub(crate) const DELEGATE_PAYLOAD_KEY: &str = "delegate_payload";
 pub const COMBINED_SERIALIZATION_FORMAT_SEPARATOR: &str = "~";
-const JWT_SEPARATOR: &str = ".";
-const CNF_KEY: &str = "cnf";
-const JWK_KEY: &str = "jwk";
+pub(crate) const JWT_SEPARATOR: &str = ".";
+pub(crate) const CNF_KEY: &str = "cnf";
+pub(crate) const JWK_KEY: &str = "jwk";
+
+/// Maximum chain depth the verifier accepts (number of KB-SD-JWT links between the
+/// issuer-signed JWT and the final KB-JWT). Protects against runaway recursion / DoS.
+pub const MAX_DELEGATION_DEPTH: usize = 32;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -60,6 +72,7 @@ pub(crate) struct SDJWTCommon {
     hash_to_disclosure: HashMap<String, String>,
     input_disclosures: Vec<String>,
     sign_alg: Option<String>,
+    pub(crate) delegation_chain: Option<delegate::DelegationChain>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
@@ -131,6 +144,32 @@ impl SDJWTCommon {
     }
 
     fn parse_compact_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
+        // Detect delegation chain first; if present, populate `delegation_chain` and the
+        // legacy fields that downstream code reads (issuer JWT + its forwarded disclosures
+        // + optional final KB-JWT). Otherwise fall through to the legacy parser.
+        if let Some(chain) = delegate::DelegationChain::try_parse_compact(&sd_jwt_with_disclosures)?
+        {
+            self.sign_alg = Self::decode_header_and_get_sign_algorithm(&chain.issuer_jwt);
+            self.unverified_input_key_binding_jwt = chain.trailing_kb_jwt.clone();
+            // hash_to_disclosure must resolve digests from EVERY segment of the chain.
+            self.input_disclosures = chain.all_disclosures();
+            self.unverified_sd_jwt = Some(chain.issuer_jwt.clone());
+
+            let mut sd_jwt = chain.issuer_jwt.split(JWT_SEPARATOR);
+            sd_jwt.next();
+            let jwt_body = sd_jwt.next().ok_or(Error::IndexOutOfBounds {
+                idx: 1,
+                length: 3,
+                msg: format!(
+                    "Invalid issuer JWT in chain: {}",
+                    chain.issuer_jwt
+                ),
+            })?;
+            self.unverified_input_sd_jwt_payload = Some(jwt_payload_decode(jwt_body)?);
+            self.delegation_chain = Some(chain);
+            return Ok(());
+        }
+
         let parts: Vec<&str> = sd_jwt_with_disclosures
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();

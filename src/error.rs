@@ -47,6 +47,31 @@ pub enum Error {
     #[error("key not found: {0}")]
     KeyNotFound(String),
 
+    #[error("malformed delegation chain: {0}")]
+    ChainParseError(String),
+
+    #[error("signature verification failed for chain link {link}: {reason}")]
+    ChainSignatureFailed { link: usize, reason: String },
+
+    #[error("typ mismatch on chain link {link}: found {found:?}, expected {expected}")]
+    ChainTypMismatch {
+        link: usize,
+        found: Option<String>,
+        expected: &'static str,
+    },
+
+    #[error("chain link {link} is missing both sd_hash and issuer_jwt_hash")]
+    MissingChainBinding { link: usize },
+
+    #[error("chain link {link} binding hash mismatch")]
+    InvalidChainBinding { link: usize },
+
+    #[error("invalid delegate payload: {0}")]
+    InvalidDelegatePayload(String),
+
+    #[error("delegation chain depth {0} exceeds configured limit")]
+    ChainDepthLimitExceeded(usize),
+
     #[error("{0}")]
     Unspecified(String),
 }
