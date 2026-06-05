@@ -13,7 +13,7 @@ use std::str::FromStr;
 use std::time;
 
 use crate::delegate::{
-    compute_issuer_jwt_hash, compute_sd_hash, ChainBindingMode,
+    compute_issuer_jwt_hash, compute_sd_hash, link_binding_mode, ChainBindingMode,
 };
 use crate::issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
 use crate::utils::base64_hash;
@@ -22,6 +22,7 @@ use crate::{
     CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG, ISSUER_JWT_HASH_KEY,
     KB_DIGEST_KEY, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER, SD_DIGESTS_KEY, SD_LIST_PREFIX,
 };
+use std::collections::HashSet;
 
 pub struct SDJWTHolder {
     sd_jwt_engine: SDJWTCommon,
@@ -415,13 +416,26 @@ impl SDJWTHolder {
     /// (`is_delegated()`), calling `delegate(...)` appends a new link to that
     /// chain. The new link binds (via `sd_hash` / `issuer_jwt_hash`) to the
     /// **last** existing link, and `holder_signing_key` MUST match that link's
-    /// `cnf`. The full chain is forwarded as-is; `claims_to_disclose` is ignored
-    /// in this mode (selective re-redaction across already-issued chain segments
-    /// is a future enhancement).
+    /// `cnf`. `claims_to_disclose` is ignored in this mode — to drop predecessor
+    /// disclosures, use `drop_disclosures`.
+    ///
+    /// # `drop_disclosures` (re-delegation only)
+    ///
+    /// Set of disclosure strings (base64url payloads, exactly as they appear on
+    /// the wire) to remove from the forwarded chain. Each drop is permitted iff
+    /// the **already-signed** link that follows the disclosure's segment used
+    /// `issuer_jwt_hash` binding; otherwise dropping would invalidate that
+    /// link's hash and the call errors with `InvalidInput`. The disclosures of
+    /// the **last existing link** are always droppable here (this call signs the
+    /// link that commits to them, so the resulting hash can re-cover whatever
+    /// subset we forward). Ignored on first-hop delegation (use
+    /// `claims_to_disclose` to control forwarded issuer disclosures there).
     ///
     /// # Errors
     ///
-    /// * `InvalidInput` — JSON serialization for chains (not yet supported).
+    /// * `InvalidInput` — JSON serialization for chains (not yet supported); or
+    ///   `drop_disclosures` includes an entry not present in the chain, or an
+    ///   entry whose segment is frozen by a downstream `sd_hash`-bound link.
     /// * `InvalidDelegatePayload` — `delegate_payload` is not a JSON object, or
     ///   the caller put a `cnf` claim in `delegate_payload` while also passing
     ///   `delegate_cnf = Some(_)`.
@@ -431,6 +445,7 @@ impl SDJWTHolder {
         delegate_payload: Value,
         delegate_sd_strategy: ClaimsForSelectiveDisclosureStrategy,
         claims_to_disclose: Option<Map<String, Value>>,
+        drop_disclosures: Option<HashSet<String>>,
         holder_signing_key: EncodingKey,
         delegate_cnf: Option<Jwk>,
         binding_mode: ChainBindingMode,
@@ -462,15 +477,18 @@ impl SDJWTHolder {
             KB_SD_JWT_TYP_HEADER.to_string()
         };
 
-        // Determine (a) the parent JWT this new link binds to, (b) its disclosures,
-        // and (c) the prefix bytes (everything that precedes the new link in the
-        // output serialization).
+        // Determine (a) the parent JWT this new link binds to, (b) its disclosures
+        // (post-drop, for the new link's binding hash to commit to), and (c) the
+        // prefix bytes (everything that precedes the new link in the output
+        // serialization).
         //
         // First hop: parent = issuer JWT; prefix = issuer-jwt + forwarded disclosures.
-        // Re-delegation: parent = last chain link; prefix = full chain serialization.
+        // Re-delegation: parent = last chain link; prefix = full chain serialization,
+        // honoring `drop_disclosures` gated by per-segment droppability.
         let (parent_jwt, parent_disclosures, prefix_parts): (String, Vec<String>, Vec<String>) =
             match self.sd_jwt_engine.delegation_chain.clone() {
                 None => {
+                    let _ = drop_disclosures; // ignored on first-hop
                     let forwarded: Vec<String> = match (binding_mode, claims_to_disclose) {
                         (ChainBindingMode::IssuerJwtHash, None) => Vec::new(),
                         (_, Some(claims)) => {
@@ -485,26 +503,108 @@ impl SDJWTHolder {
                     (self.serialized_sd_jwt.clone(), forwarded, prefix)
                 }
                 Some(chain) => {
-                    // Re-delegation. The new link binds to the LAST link of the existing
-                    // chain. The Delegate Holder forwards the full chain as-is —
-                    // selective re-redaction across chain segments is a future
-                    // enhancement; for now `claims_to_disclose` is ignored here.
-                    let _ = claims_to_disclose;
+                    let _ = claims_to_disclose; // re-delegation uses drop_disclosures instead
+                    let drops: HashSet<String> = drop_disclosures.unwrap_or_default();
                     let last_link = chain.links.last().ok_or_else(|| {
                         Error::InvalidState(
                             "delegation_chain is present but has no links".into(),
                         )
                     })?;
-                    let parent_jwt = last_link.jwt.clone();
-                    let parent_disclosures = last_link.disclosures.clone();
-                    let mut prefix: Vec<String> = Vec::new();
-                    prefix.push(chain.issuer_jwt.clone());
-                    prefix.extend(chain.issuer_disclosures.iter().cloned());
-                    for link in &chain.links {
-                        prefix.push(link.jwt.clone());
-                        prefix.extend(link.disclosures.iter().cloned());
+
+                    // For each existing segment, decide whether its disclosures can
+                    // be dropped:
+                    //  - issuer segment      ← gated by chain.links[0]'s binding
+                    //  - chain.links[i] seg  ← gated by chain.links[i+1]'s binding
+                    //  - chain.links[last]   ← gated by OUR new link (we resign it,
+                    //                          post-drop, with `binding_mode`).
+                    fn segment_droppable(
+                        next_link_jwt: Option<&str>,
+                        our_binding: ChainBindingMode,
+                    ) -> bool {
+                        match next_link_jwt {
+                            Some(jwt) => {
+                                link_binding_mode(jwt)
+                                    == Some(ChainBindingMode::IssuerJwtHash)
+                            }
+                            None => {
+                                // No already-signed link constrains this segment; we
+                                // produce the next hash and can match whatever subset
+                                // we forward regardless of our binding mode.
+                                let _ = our_binding;
+                                true
+                            }
+                        }
                     }
-                    (parent_jwt, parent_disclosures, prefix)
+
+                    let mut prefix: Vec<String> = Vec::new();
+                    let mut used_drops: HashSet<&String> = HashSet::new();
+
+                    // Issuer segment.
+                    prefix.push(chain.issuer_jwt.clone());
+                    let issuer_seg_droppable = segment_droppable(
+                        chain.links.first().map(|l| l.jwt.as_str()),
+                        binding_mode,
+                    );
+                    for d in &chain.issuer_disclosures {
+                        if drops.contains(d) {
+                            if !issuer_seg_droppable {
+                                return Err(Error::InvalidInput(format!(
+                                    "cannot drop disclosure from issuer segment: \
+                                     downstream link uses sd_hash binding which \
+                                     committed to it",
+                                )));
+                            }
+                            used_drops.insert(d);
+                        } else {
+                            prefix.push(d.clone());
+                        }
+                    }
+
+                    // Each existing chain link's segment.
+                    let mut last_link_filtered_disclosures: Vec<String> = Vec::new();
+                    for (i, link) in chain.links.iter().enumerate() {
+                        prefix.push(link.jwt.clone());
+                        let next_jwt = chain.links.get(i + 1).map(|l| l.jwt.as_str());
+                        let droppable = segment_droppable(next_jwt, binding_mode);
+                        for d in &link.disclosures {
+                            if drops.contains(d) {
+                                if !droppable {
+                                    return Err(Error::InvalidInput(format!(
+                                        "cannot drop disclosure from chain link {}: \
+                                         downstream link uses sd_hash binding which \
+                                         committed to it",
+                                        i
+                                    )));
+                                }
+                                used_drops.insert(d);
+                            } else {
+                                prefix.push(d.clone());
+                                if i + 1 == chain.links.len() {
+                                    last_link_filtered_disclosures.push(d.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    // Reject unrecognized drop targets — likely indicates a bug in the
+                    // caller (typo or stale reference); we'd rather error than silently
+                    // pass through.
+                    if used_drops.len() < drops.len() {
+                        let unmatched: Vec<&String> =
+                            drops.iter().filter(|d| !used_drops.contains(d)).collect();
+                        return Err(Error::InvalidInput(format!(
+                            "drop_disclosures contains {} entries not present in the \
+                             chain (e.g. {:?})",
+                            unmatched.len(),
+                            unmatched.first()
+                        )));
+                    }
+
+                    (
+                        last_link.jwt.clone(),
+                        last_link_filtered_disclosures,
+                        prefix,
+                    )
                 }
             };
 
@@ -880,6 +980,7 @@ mod tests {
                 delegate_payload,
                 ClaimsForSelectiveDisclosureStrategy::AllLevels,
                 Some(user_claims.as_object().unwrap().clone()),
+                None,
                 holder_signing_key,
                 None,
                 ChainBindingMode::SdHash,

@@ -10,8 +10,11 @@
 //! See `docs/delegate-sd-jwt-design.md` for the protocol-level design.
 
 use crate::error::{Error, Result};
-use crate::utils::base64_hash;
-use crate::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, JWT_SEPARATOR, MAX_DELEGATION_DEPTH};
+use crate::utils::{base64_hash, base64url_decode};
+use crate::{
+    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, ISSUER_JWT_HASH_KEY, JWT_SEPARATOR, KB_DIGEST_KEY,
+    MAX_DELEGATION_DEPTH,
+};
 
 /// How a KB-SD-JWT binds to the preceding component in the chain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -220,6 +223,29 @@ pub(crate) fn compute_sd_hash(jwt: &str, disclosures: &[String]) -> String {
 /// `issuer_jwt_hash` over a JWT only (no disclosures).
 pub(crate) fn compute_issuer_jwt_hash(jwt: &str) -> String {
     base64_hash(jwt.as_bytes())
+}
+
+/// Inspect a KB-SD-JWT's payload (without verifying its signature — the chain
+/// member already holds the link, the goal here is solely to read which binding
+/// claim is in use). Returns `Some(SdHash)` if `sd_hash` is present (preferred when
+/// both are present, matching the verifier's preference order), `Some(IssuerJwtHash)`
+/// if only `issuer_jwt_hash` is present, `None` if neither claim is present or the
+/// JWT cannot be parsed.
+pub(crate) fn link_binding_mode(link_jwt: &str) -> Option<ChainBindingMode> {
+    let parts: Vec<&str> = link_jwt.split(JWT_SEPARATOR).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let body_bytes = base64url_decode(parts[1]).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&body_bytes).ok()?;
+    let obj = payload.as_object()?;
+    if obj.contains_key(KB_DIGEST_KEY) {
+        return Some(ChainBindingMode::SdHash);
+    }
+    if obj.contains_key(ISSUER_JWT_HASH_KEY) {
+        return Some(ChainBindingMode::IssuerJwtHash);
+    }
+    None
 }
 
 #[cfg(test)]
