@@ -107,6 +107,35 @@ impl DelegationChain {
             return Err(Error::ChainDepthLimitExceeded(link_jwt_indices.len()));
         }
 
+        // Spec rule: each chain-link KB-SD-JWT MUST be immediately preceded by an
+        // empty component (`~~` on the wire). No other empty components are allowed
+        // except the trailing one when there is no final KB-JWT.
+        for (i, t) in tokens.iter().enumerate() {
+            if !t.is_empty() {
+                continue;
+            }
+            // Trailing terminator (no final KB-JWT).
+            if trailing_tilde && i + 1 == tokens.len() {
+                continue;
+            }
+            // Mandatory separator before the next chain link.
+            if i + 1 < tokens.len() && link_jwt_indices.contains(&(i + 1)) {
+                continue;
+            }
+            return Err(Error::ChainParseError(format!(
+                "unexpected empty component at index {} (only allowed before a chain-link KB-SD-JWT)",
+                i
+            )));
+        }
+        for &link_idx in &link_jwt_indices {
+            if link_idx == 0 || !tokens[link_idx - 1].is_empty() {
+                return Err(Error::ChainParseError(format!(
+                    "missing mandatory empty component before chain-link KB-SD-JWT at index {}",
+                    link_idx
+                )));
+            }
+        }
+
         // Walk tokens, building per-segment disclosure buckets between JWTs.
         let issuer_jwt = tokens[0].to_string();
         let mut links: Vec<ChainLink> = Vec::with_capacity(link_jwt_indices.len());
@@ -124,10 +153,12 @@ impl DelegationChain {
                 .copied()
                 .unwrap_or(end_boundary);
             // Disclosures live strictly between seg_start+1 and next_boundary.
+            // Empty tokens (the mandatory separator and the trailing terminator) were
+            // validated above and are skipped here so they don't become disclosures.
             let mut bucket: Vec<String> = Vec::new();
             for t in &tokens[seg_start + 1..next_boundary] {
                 if t.is_empty() {
-                    continue; // ignore empty slots (e.g. `~~` for zero disclosures)
+                    continue;
                 }
                 if t.contains(JWT_SEPARATOR) {
                     return Err(Error::ChainParseError(format!(
@@ -157,15 +188,22 @@ impl DelegationChain {
         }))
     }
 
-    /// Serialize the chain to its compact form. The output is normalized: empty
-    /// disclosure slots are omitted (writers emit `<jwt>~<jwt>~...` rather than
-    /// `<jwt>~~<jwt>~...`). Hash bindings are computed against this normalized form.
+    /// Serialize the chain to its compact form. Each non-final chain-link
+    /// KB-SD-JWT is preceded by an empty component (the wire shows `~~`), per
+    /// the dSD-JWT serialization rule:
+    ///
+    /// > the resulting array of components MUST have an empty component between
+    /// > the last disclosure of each SD-JWT before the following KB-SD-JWT
+    ///
+    /// The final KB-JWT (when present) is NOT preceded by `~~` — only chain links
+    /// (KB-SD-JWTs) take the empty separator.
     #[allow(dead_code)] // kept for test/diagnostic round-tripping
     pub fn serialize_compact(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         parts.push(&self.issuer_jwt);
         parts.extend(self.issuer_disclosures.iter().map(|s| s.as_str()));
         for link in &self.links {
+            parts.push(""); // mandatory empty component before each chain link
             parts.push(&link.jwt);
             parts.extend(link.disclosures.iter().map(|s| s.as_str()));
         }
@@ -191,12 +229,15 @@ impl DelegationChain {
     }
 
     /// Serialize the chain WITHOUT the trailing KB-JWT, ending in `~`. Used as the
-    /// hashed input for a final KB-JWT's `sd_hash` in a dSD-JWT+KB.
+    /// hashed input for a final KB-JWT's `sd_hash` in a dSD-JWT+KB. Includes the
+    /// mandatory empty component before each chain-link KB-SD-JWT (same rule as
+    /// [`serialize_compact`]).
     pub fn serialize_for_final_kb_hash(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         parts.push(&self.issuer_jwt);
         parts.extend(self.issuer_disclosures.iter().map(|s| s.as_str()));
         for link in &self.links {
+            parts.push(""); // mandatory empty component before each chain link
             parts.push(&link.jwt);
             parts.extend(link.disclosures.iter().map(|s| s.as_str()));
         }
@@ -272,8 +313,9 @@ mod tests {
 
     #[test]
     fn parse_single_delegation_no_final_kb() {
+        // Spec form: `~~` between issuer segment and chain-link KB-SD-JWT.
         let s = format!(
-            "{}~D1~{}~D2~",
+            "{}~D1~~{}~D2~",
             fake_jwt("issuer"),
             fake_jwt("kbsd1"),
         );
@@ -288,8 +330,9 @@ mod tests {
 
     #[test]
     fn parse_single_delegation_with_final_kb() {
+        // Spec form: `~~` before chain link, single `~` before final KB-JWT.
         let s = format!(
-            "{}~D1~{}~D2~{}",
+            "{}~D1~~{}~D2~{}",
             fake_jwt("issuer"),
             fake_jwt("kbsd1"),
             fake_jwt("finalkb"),
@@ -301,7 +344,8 @@ mod tests {
 
     #[test]
     fn parse_zero_issuer_disclosures_compact_form() {
-        // The "~~" form — zero forwarded issuer disclosures.
+        // Zero forwarded issuer disclosures: the `~~` after the issuer JWT is the
+        // mandatory separator (there were zero disclosures in between).
         let s = format!("{}~~{}~", fake_jwt("issuer"), fake_jwt("kbsd1"));
         let chain = DelegationChain::try_parse_compact(&s).unwrap().unwrap();
         assert!(chain.issuer_disclosures.is_empty());
@@ -311,7 +355,7 @@ mod tests {
     #[test]
     fn parse_two_hop_delegation() {
         let s = format!(
-            "{}~D1~{}~D2~{}~D3~",
+            "{}~D1~~{}~D2~~{}~D3~",
             fake_jwt("issuer"),
             fake_jwt("kbsd1"),
             fake_jwt("kbsd2"),
@@ -325,7 +369,7 @@ mod tests {
     #[test]
     fn serialize_round_trip() {
         let s = format!(
-            "{}~D1~{}~D2~{}",
+            "{}~D1~~{}~D2~{}",
             fake_jwt("issuer"),
             fake_jwt("kbsd1"),
             fake_jwt("finalkb"),
@@ -335,10 +379,48 @@ mod tests {
     }
 
     #[test]
+    fn reject_missing_mandatory_empty_component() {
+        // Spec violation: chain-link KB-SD-JWT not preceded by an empty component.
+        let s = format!(
+            "{}~D1~{}~D2~",
+            fake_jwt("issuer"),
+            fake_jwt("kbsd1"),
+        );
+        let err = DelegationChain::try_parse_compact(&s).unwrap_err();
+        match err {
+            Error::ChainParseError(msg) => {
+                assert!(
+                    msg.contains("missing mandatory empty component"),
+                    "wrong error message: {msg}"
+                );
+            }
+            other => panic!("expected ChainParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_extra_empty_component() {
+        // Extra empty component not preceding any chain link.
+        let s = format!(
+            "{}~D1~~D2~~{}~D3~",
+            fake_jwt("issuer"),
+            fake_jwt("kbsd1"),
+        );
+        let err = DelegationChain::try_parse_compact(&s).unwrap_err();
+        match err {
+            Error::ChainParseError(msg) => {
+                assert!(msg.contains("unexpected empty component"), "wrong message: {msg}");
+            }
+            other => panic!("expected ChainParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn depth_limit_enforced() {
+        // Build a too-deep chain in spec form (`~~` before each link).
         let mut s = fake_jwt("issuer");
         for i in 0..MAX_DELEGATION_DEPTH + 1 {
-            s.push('~');
+            s.push_str("~~");
             s.push_str(&fake_jwt(&format!("link{i}")));
         }
         s.push('~');

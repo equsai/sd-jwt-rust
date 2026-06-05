@@ -560,9 +560,13 @@ impl SDJWTHolder {
                         }
                     }
 
-                    // Each existing chain link's segment.
+                    // Each existing chain link's segment. Insert the mandatory empty
+                    // component before each link to satisfy the dSD-JWT serialization
+                    // rule (empty component between an SD-JWT's last disclosure and
+                    // the following KB-SD-JWT).
                     let mut last_link_filtered_disclosures: Vec<String> = Vec::new();
                     for (i, link) in chain.links.iter().enumerate() {
+                        prefix.push(String::new());
                         prefix.push(link.jwt.clone());
                         let next_jwt = chain.links.get(i + 1).map(|l| l.jwt.as_str());
                         let droppable = segment_droppable(next_jwt, binding_mode);
@@ -631,10 +635,13 @@ impl SDJWTHolder {
             extra_always_revealed,
         )?;
 
+        // The new KB-SD-JWT is itself a chain link, so it MUST be preceded by an
+        // empty component (`~~` on the wire). The prefix's tail ends at the last
+        // disclosure of the preceding segment, so we append `~~<combined>`.
         let prefix = prefix_parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         Ok(format!(
-            "{}{}{}",
-            prefix, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, combined,
+            "{prefix}{sep}{sep}{combined}",
+            sep = COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
         ))
     }
 }

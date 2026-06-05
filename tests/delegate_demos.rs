@@ -186,11 +186,12 @@ fn issuer_jwt_hash_binding_mode_works() {
         .unwrap();
 
     // The resulting compact form should contain no issuer disclosures between the
-    // issuer JWT and the KB-SD-JWT.
+    // issuer JWT and the KB-SD-JWT. Per spec, the chain link is preceded by an
+    // empty component (`~~`), so the layout is:
+    //   <issuer-jwt> ~~ <KB-SD-JWT> ~ <D'1>...<D'N> ~
     let parts: Vec<&str> = dsd_jwt.split('~').collect();
-    // Layout: <issuer-jwt> ~ <KB-SD-JWT> ~ <D'1...DN> ~
-    // Position 1 should be the KB-SD-JWT (contains '.').
-    assert!(parts[1].contains('.'), "expected KB-SD-JWT right after issuer JWT");
+    assert!(parts[1].is_empty(), "expected mandatory empty component after issuer JWT");
+    assert!(parts[2].contains('.'), "expected KB-SD-JWT at position 2 (after ~~)");
 
     let verifier = SDJWTVerifier::new(
         dsd_jwt,
@@ -490,20 +491,25 @@ fn tamper_kb_sd_jwt_link_fails_verification() {
         .unwrap();
 
     // Flip a byte inside the KB-SD-JWT's signature (last segment of the link JWT).
-    // Layout: <issuer-jwt> ~ <KB-SD-JWT> ~ <D'> ~
+    // Per spec, the layout is: <issuer-jwt> ~~ <KB-SD-JWT> ~ <D'> ~
     let parts: Vec<&str> = dsd_jwt.split('~').collect();
-    let kb_sd_jwt = parts[1];
+    let kb_sd_jwt_idx = parts
+        .iter()
+        .skip(1)
+        .position(|t| !t.is_empty() && t.contains('.'))
+        .expect("KB-SD-JWT not found in chain")
+        + 1;
+    let kb_sd_jwt = parts[kb_sd_jwt_idx];
     let kb_parts: Vec<&str> = kb_sd_jwt.split('.').collect();
     assert_eq!(kb_parts.len(), 3);
     let mut tampered_sig = String::from(kb_parts[2]);
-    // Flip the last char.
     let last = tampered_sig.pop().unwrap();
     let replacement = if last == 'A' { 'B' } else { 'A' };
     tampered_sig.push(replacement);
     let tampered_kb_jwt = format!("{}.{}.{}", kb_parts[0], kb_parts[1], tampered_sig);
 
     let mut tampered_parts = parts.clone();
-    tampered_parts[1] = &tampered_kb_jwt;
+    tampered_parts[kb_sd_jwt_idx] = &tampered_kb_jwt;
     let tampered = tampered_parts.join("~");
 
     let result = SDJWTVerifier::new(
