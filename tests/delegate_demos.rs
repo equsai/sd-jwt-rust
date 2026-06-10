@@ -2,15 +2,15 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end Delegate SD-JWT tests: Issuer → Holder → Delegate Holder → Verifier.
+//! End-to-end Delegate SD-JWT tests: Issuer → DelegateHolder → DelegateVerifier.
 
 mod utils;
 
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use sd_jwt_rs::{
-    ChainBindingMode, ClaimsForSelectiveDisclosureStrategy, SDJWTHolder, SDJWTIssuer,
-    SDJWTSerializationFormat, SDJWTVerifier,
+    ChainBindingMode, ClaimsForSelectiveDisclosureStrategy, DelegateHolder, DelegateVerifier,
+    SDJWTIssuer, SDJWTSerializationFormat,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -32,6 +32,12 @@ fn issuer_key_resolver() -> Box<dyn Fn(&str, &jsonwebtoken::Header) -> DecodingK
     Box::new(|_iss, _hdr| {
         DecodingKey::from_ec_pem(ISSUER_PUBLIC_KEY.as_bytes()).expect("ec pub key")
     })
+}
+
+/// Build a `cnf` claim object (`{"jwk": <jwk>}`) from a JWK JSON string, for
+/// embedding inside a Delegate Payload (required for kb+sd-jwt+kb links).
+fn cnf_claim(jwk_json: &str) -> Value {
+    json!({ "jwk": serde_json::from_str::<Value>(jwk_json).unwrap() })
 }
 
 fn issue_holder_bound_sd_jwt(claims: Value, holder_jwk: Jwk) -> String {
@@ -61,7 +67,7 @@ fn single_delegation_no_final_kb_round_trips() {
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims.clone(), holder_jwk);
 
     // Holder loads the SD-JWT and delegates to a Delegate Holder.
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
 
     let delegate_payload = json!({
@@ -70,36 +76,28 @@ fn single_delegation_no_final_kb_round_trips() {
         "limit": 100
     });
 
-    // No delegate_cnf → terminal kb+sd-jwt link, no further delegation possible.
+    // No cnf in the payload → terminal kb+sd-jwt link, no further delegation possible.
     let dsd_jwt = holder
         .delegate(
-            delegate_payload.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![delegate_payload.clone()],
             Some(user_claims.as_object().unwrap().clone()),
             None,
             holder_signing_key,
-            None,
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
     // Verifier walks the chain.
-    let verifier = SDJWTVerifier::new(
-        dsd_jwt,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    )
-    .expect("chain verification should succeed");
+    let verified = DelegateVerifier::verify(dsd_jwt, issuer_key_resolver(), None, None)
+        .expect("chain verification should succeed");
 
     // One Delegate Payload entry, no `+kb` ⇒ no cnf in chain_cnfs.
-    assert_eq!(verifier.verified_delegate_payloads.len(), 1);
-    assert!(verifier.chain_cnfs.is_empty());
+    assert_eq!(verified.delegate_payloads.len(), 1);
+    assert!(verified.chain_cnfs.is_empty());
 
-    // Delegate Payload claims must be visible in verified_claims (layered on top of issuer).
-    let claims = verifier.verified_claims.as_object().expect("object");
+    // Delegate Payload claims must be visible in claims (layered on top of issuer).
+    let claims = verified.claims.as_object().expect("object");
     assert_eq!(claims.get("scope"), Some(&Value::String("purchase".into())));
     assert_eq!(
         claims.get("merchant"),
@@ -117,7 +115,7 @@ fn single_delegation_no_final_kb_round_trips() {
 }
 
 #[test]
-fn delegate_payload_appears_in_verified_delegate_payloads() {
+fn delegate_payload_appears_in_delegate_payloads() {
     let user_claims = json!({
         "iss": "https://example.com/issuer",
         "iat": 1683000000,
@@ -127,32 +125,23 @@ fn delegate_payload_appears_in_verified_delegate_payloads() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims.clone(), holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
 
     let dsd_jwt = holder
         .delegate(
-            json!({"scope": "read-only"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"scope": "read-only"})],
             Some(Map::new()), // forward no original disclosures
             None,
             holder_signing_key,
-            None,
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
-    let verifier = SDJWTVerifier::new(
-        dsd_jwt,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    )
-    .unwrap();
+    let verified = DelegateVerifier::verify(dsd_jwt, issuer_key_resolver(), None, None).unwrap();
 
-    let dp = &verifier.verified_delegate_payloads[0];
+    let dp = &verified.delegate_payloads[0];
     assert_eq!(dp.get("scope"), Some(&Value::String("read-only".into())));
 }
 
@@ -168,18 +157,16 @@ fn issuer_jwt_hash_binding_mode_works() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
 
     // IssuerJwtHash mode: Delegate Holder can drop the original disclosures from the wire.
     let dsd_jwt = holder
         .delegate(
-            json!({"purpose": "audit"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"purpose": "audit"})],
             None, // skip forwarding entirely
             None,
             holder_signing_key,
-            None,
             ChainBindingMode::IssuerJwtHash,
             None,
         )
@@ -193,17 +180,11 @@ fn issuer_jwt_hash_binding_mode_works() {
     assert!(parts[1].is_empty(), "expected mandatory empty component after issuer JWT");
     assert!(parts[2].contains('.'), "expected KB-SD-JWT at position 2 (after ~~)");
 
-    let verifier = SDJWTVerifier::new(
-        dsd_jwt,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    )
-    .expect("chain verification with issuer_jwt_hash binding should succeed");
+    let verified = DelegateVerifier::verify(dsd_jwt, issuer_key_resolver(), None, None)
+        .expect("chain verification with issuer_jwt_hash binding should succeed");
 
-    assert_eq!(verifier.verified_delegate_payloads.len(), 1);
-    let claims = verifier.verified_claims.as_object().unwrap();
+    assert_eq!(verified.delegate_payloads.len(), 1);
+    let claims = verified.claims.as_object().unwrap();
     assert_eq!(claims.get("purpose"), Some(&Value::String("audit".into())));
 }
 
@@ -218,27 +199,29 @@ fn dsd_jwt_with_kb_proof_of_possession_round_trips() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    // Holder delegates to a Delegate Holder, binding to delegate_cnf so the Delegate
-    // Holder can sign a final KB-JWT.
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    // Holder delegates to a Delegate Holder, embedding the Delegate Holder's cnf so
+    // they can sign a final KB-JWT.
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
 
+    // cnf inside the Delegate Payload → kb+sd-jwt+kb, enabling the final KB-JWT.
     let dsd_jwt = holder
         .delegate(
-            json!({"scope": "view-account", "exp": 1893456000_i64}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({
+                "scope": "view-account",
+                "exp": 1893456000_i64,
+                "cnf": cnf_claim(DELEGATE2_JWK),
+            })],
             Some(Map::new()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
     // Delegate Holder loads the dSD-JWT and creates a presentation with a final KB-JWT.
-    let mut delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let delegate = DelegateHolder::load(dsd_jwt).unwrap();
     assert!(delegate.is_delegated());
     assert_eq!(delegate.delegation_depth(), 1);
 
@@ -249,8 +232,7 @@ fn dsd_jwt_with_kb_proof_of_possession_round_trips() {
     let aud = "verifier.example".to_string();
 
     let presentation = delegate
-        .create_presentation(
-            Map::new(),
+        .present(
             Some(nonce.clone()),
             Some(aud.clone()),
             Some(delegate_signing_key),
@@ -259,22 +241,16 @@ fn dsd_jwt_with_kb_proof_of_possession_round_trips() {
         .unwrap();
 
     // Verifier walks the chain AND validates the final KB-JWT.
-    let verifier = SDJWTVerifier::new(
-        presentation,
-        issuer_key_resolver(),
-        Some(aud),
-        Some(nonce),
-        SDJWTSerializationFormat::Compact,
-    )
-    .expect("dSD-JWT+KB verification should succeed");
+    let verified = DelegateVerifier::verify(presentation, issuer_key_resolver(), Some(aud), Some(nonce))
+        .expect("dSD-JWT+KB verification should succeed");
 
-    assert_eq!(verifier.verified_delegate_payloads.len(), 1);
+    assert_eq!(verified.delegate_payloads.len(), 1);
     assert_eq!(
-        verifier.chain_cnfs.len(),
+        verified.chain_cnfs.len(),
         1,
         "kb+sd-jwt+kb link must yield one cnf in chain_cnfs"
     );
-    let claims = verifier.verified_claims.as_object().unwrap();
+    let claims = verified.claims.as_object().unwrap();
     assert_eq!(claims.get("scope"), Some(&Value::String("view-account".into())));
 }
 
@@ -290,56 +266,45 @@ fn two_hop_delegation_round_trips() {
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
     // Hop 1: Holder → Delegate Holder #1 (cnf = delegate2_jwk, typ kb+sd-jwt+kb).
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
 
     let after_hop1 = holder
         .delegate(
-            json!({"hop": 1, "scope": "intermediate"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 1, "scope": "intermediate", "cnf": cnf_claim(DELEGATE2_JWK)})],
             Some(Map::new()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
     // Hop 2: Delegate Holder #1 → Delegate Holder #2 (terminal kb+sd-jwt).
-    let mut delegate1 = SDJWTHolder::new(after_hop1, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 = DelegateHolder::load(after_hop1).unwrap();
     let delegate1_signing_key =
         EncodingKey::from_ed_pem(DELEGATE2_KEY_PEM.as_bytes()).unwrap();
 
     let after_hop2 = delegate1
         .delegate(
-            json!({"hop": 2, "scope": "leaf"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 2, "scope": "leaf"})],
             None,
             None,
             delegate1_signing_key,
-            None, // terminal
             ChainBindingMode::SdHash,
             Some("EdDSA".into()),
         )
         .unwrap();
 
     // Verifier walks the 2-link chain.
-    let verifier = SDJWTVerifier::new(
-        after_hop2,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    )
-    .expect("two-hop chain verification should succeed");
+    let verified = DelegateVerifier::verify(after_hop2, issuer_key_resolver(), None, None)
+        .expect("two-hop chain verification should succeed");
 
-    assert_eq!(verifier.verified_delegate_payloads.len(), 2);
+    assert_eq!(verified.delegate_payloads.len(), 2);
     // Hop1 was kb+sd-jwt+kb → contributes one cnf. Hop2 is terminal kb+sd-jwt → none.
-    assert_eq!(verifier.chain_cnfs.len(), 1);
+    assert_eq!(verified.chain_cnfs.len(), 1);
 
-    let claims = verifier.verified_claims.as_object().unwrap();
+    let claims = verified.claims.as_object().unwrap();
     // hop2 claims override hop1 because we layer in chain order.
     assert_eq!(claims.get("hop"), Some(&Value::from(2)));
     assert_eq!(claims.get("scope"), Some(&Value::String("leaf".into())));
@@ -358,31 +323,27 @@ fn final_kb_jwt_signed_with_wrong_key_fails() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
 
     let dsd_jwt = holder
         .delegate(
-            json!({"scope": "view"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"scope": "view", "cnf": cnf_claim(DELEGATE2_JWK)})],
             Some(Map::new()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
-    let mut delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let delegate = DelegateHolder::load(dsd_jwt).unwrap();
     // Wrong: sign the final KB-JWT with the Holder's (P-256) key instead of
     // the Delegate Holder's (Ed25519) key.
     let wrong_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
 
     let presentation = delegate
-        .create_presentation(
-            Map::new(),
+        .present(
             Some("n".into()),
             Some("a".into()),
             Some(wrong_key),
@@ -390,13 +351,8 @@ fn final_kb_jwt_signed_with_wrong_key_fails() {
         )
         .unwrap();
 
-    let result = SDJWTVerifier::new(
-        presentation,
-        issuer_key_resolver(),
-        Some("a".into()),
-        Some("n".into()),
-        SDJWTSerializationFormat::Compact,
-    );
+    let result =
+        DelegateVerifier::verify(presentation, issuer_key_resolver(), Some("a".into()), Some("n".into()));
     assert!(
         result.is_err(),
         "verifier must reject a final KB-JWT signed with the wrong key"
@@ -417,46 +373,35 @@ fn redelegation_with_wrong_holder_key_fails() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
 
     let after_hop1 = holder
         .delegate(
-            json!({"hop": 1}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 1, "cnf": cnf_claim(DELEGATE2_JWK)})],
             Some(Map::new()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
-    let mut delegate1 = SDJWTHolder::new(after_hop1, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 = DelegateHolder::load(after_hop1).unwrap();
     // Wrong: re-sign with the Holder's P-256 key (the chain expects Ed25519 cnf).
     let wrong_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
     let after_hop2 = delegate1
         .delegate(
-            json!({"hop": 2}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 2})],
             None,
             None,
             wrong_key,
-            None,
             ChainBindingMode::SdHash,
             Some("ES256".into()),
         )
         .unwrap();
 
-    let result = SDJWTVerifier::new(
-        after_hop2,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    );
+    let result = DelegateVerifier::verify(after_hop2, issuer_key_resolver(), None, None);
     assert!(
         result.is_err(),
         "verifier must reject a re-delegation signed with the wrong holder key"
@@ -474,17 +419,15 @@ fn tamper_kb_sd_jwt_link_fails_verification() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
 
     let dsd_jwt = holder
         .delegate(
-            json!({"scope": "purchase"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"scope": "purchase"})],
             Some(Map::new()),
             None,
             holder_signing_key,
-            None,
             ChainBindingMode::SdHash,
             None,
         )
@@ -512,13 +455,7 @@ fn tamper_kb_sd_jwt_link_fails_verification() {
     tampered_parts[kb_sd_jwt_idx] = &tampered_kb_jwt;
     let tampered = tampered_parts.join("~");
 
-    let result = SDJWTVerifier::new(
-        tampered,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    );
+    let result = DelegateVerifier::verify(tampered, issuer_key_resolver(), None, None);
 
     assert!(
         result.is_err(),
@@ -542,18 +479,15 @@ fn redelegation_can_drop_issuer_disclosures_when_link1_used_issuer_jwt_hash() {
 
     // Hop 1: Holder forwards ALL issuer disclosures, but link 1 commits via
     // IssuerJwtHash (so the disclosures are NOT cryptographically frozen).
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
     let after_hop1 = holder
         .delegate(
-            json!({"hop": 1}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 1, "cnf": cnf_claim(DELEGATE2_JWK)})],
             // Forward ALL claims so disclosures appear on the wire.
             Some(user_claims.as_object().unwrap().clone()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::IssuerJwtHash, // ← key choice
             None,
         )
@@ -570,16 +504,14 @@ fn redelegation_can_drop_issuer_disclosures_when_link1_used_issuer_jwt_hash() {
     drops.insert(drop_target.clone());
 
     // Hop 2: Delegate Holder #1 re-delegates and drops one issuer disclosure.
-    let mut delegate1 = SDJWTHolder::new(after_hop1.clone(), SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 = DelegateHolder::load(after_hop1.clone()).unwrap();
     let delegate1_signing_key = EncodingKey::from_ed_pem(DELEGATE2_KEY_PEM.as_bytes()).unwrap();
     let after_hop2 = delegate1
         .delegate(
-            json!({"hop": 2}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 2})],
             None,
             Some(drops),
             delegate1_signing_key,
-            None,
             ChainBindingMode::SdHash,
             Some("EdDSA".into()),
         )
@@ -592,15 +524,9 @@ fn redelegation_can_drop_issuer_disclosures_when_link1_used_issuer_jwt_hash() {
     );
 
     // The chain must still verify cleanly.
-    let verifier = SDJWTVerifier::new(
-        after_hop2,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    )
-    .expect("chain must verify after permitted drop");
-    assert_eq!(verifier.verified_delegate_payloads.len(), 2);
+    let verified = DelegateVerifier::verify(after_hop2, issuer_key_resolver(), None, None)
+        .expect("chain must verify after permitted drop");
+    assert_eq!(verified.delegate_payloads.len(), 2);
 }
 
 #[test]
@@ -617,17 +543,14 @@ fn redelegation_cannot_drop_disclosures_frozen_by_sd_hash() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims.clone(), holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
     let after_hop1 = holder
         .delegate(
-            json!({"hop": 1}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 1, "cnf": cnf_claim(DELEGATE2_JWK)})],
             Some(user_claims.as_object().unwrap().clone()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::SdHash, // ← freezes issuer disclosures
             None,
         )
@@ -641,15 +564,13 @@ fn redelegation_cannot_drop_disclosures_frozen_by_sd_hash() {
     let mut drops: HashSet<String> = HashSet::new();
     drops.insert(issuer_disc);
 
-    let mut delegate1 = SDJWTHolder::new(after_hop1, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 = DelegateHolder::load(after_hop1).unwrap();
     let delegate1_signing_key = EncodingKey::from_ed_pem(DELEGATE2_KEY_PEM.as_bytes()).unwrap();
     let result = delegate1.delegate(
-        json!({"hop": 2}),
-        ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        vec![json!({"hop": 2})],
         None,
         Some(drops),
         delegate1_signing_key,
-        None,
         ChainBindingMode::SdHash,
         Some("EdDSA".into()),
     );
@@ -661,11 +582,12 @@ fn redelegation_cannot_drop_disclosures_frozen_by_sd_hash() {
 }
 
 #[test]
-fn redelegation_can_always_drop_last_segment_disclosures() {
-    // Hop 1 forwards an issuer disclosure AND link-1 produces its own disclosures.
-    // Even with hop 1 using SdHash (freezing issuer disclosures), Delegate Holder #1
-    // can still drop disclosures from link 1's own segment because the link
-    // committing to them is the one being signed right now (hop 2).
+fn redelegation_narrows_multi_alternative_predecessor_link() {
+    // Hop 1 bundles TWO delegate_payload alternatives (each carrying its own cnf),
+    // which become array-element disclosures in link 1's segment. When Delegate
+    // Holder #1 re-delegates, it must narrow link 1 down to a single disclosed
+    // alternative — always permitted because hop 2 is the link committing to
+    // link 1's disclosures right now.
     let user_claims = json!({
         "iss": "https://example.com/issuer",
         "iat": 1683000000,
@@ -675,57 +597,52 @@ fn redelegation_can_always_drop_last_segment_disclosures() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
-    // Hop 1 has its OWN selectively-disclosable claims, generating link-1 disclosures.
+    // Two alternatives → both are array-element disclosures of link 1.
     let after_hop1 = holder
         .delegate(
-            json!({"hop": 1, "extra": "secret-1", "other": "secret-2"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![
+                json!({"hop": 1, "scope": "a", "cnf": cnf_claim(DELEGATE2_JWK)}),
+                json!({"hop": 1, "scope": "b", "cnf": cnf_claim(DELEGATE2_JWK)}),
+            ],
             Some(Map::new()), // no forwarded issuer disclosures
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::SdHash,
             None,
         )
         .unwrap();
 
-    // The disclosures we see on the wire belong to link 1.
-    let link1_disclosures: Vec<String> = after_hop1
+    // The disclosures on the wire are link 1's two alternatives.
+    let alternatives: Vec<String> = after_hop1
         .split('~')
         .filter(|t| !t.is_empty() && !t.contains('.'))
         .map(String::from)
         .collect();
-    assert!(link1_disclosures.len() >= 2);
+    assert_eq!(alternatives.len(), 2, "expected two alternative disclosures");
+    // Drop one alternative, leaving exactly one disclosed.
     let mut drops: HashSet<String> = HashSet::new();
-    drops.insert(link1_disclosures[0].clone());
+    drops.insert(alternatives[0].clone());
 
-    let mut delegate1 = SDJWTHolder::new(after_hop1, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 = DelegateHolder::load(after_hop1).unwrap();
     let delegate1_signing_key = EncodingKey::from_ed_pem(DELEGATE2_KEY_PEM.as_bytes()).unwrap();
     let after_hop2 = delegate1
         .delegate(
-            json!({"hop": 2}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"hop": 2})],
             None,
             Some(drops),
             delegate1_signing_key,
-            None,
             ChainBindingMode::SdHash,
             Some("EdDSA".into()),
         )
-        .expect("dropping the last existing link's disclosures is always permitted");
+        .expect("narrowing the last existing link's alternatives is always permitted");
 
-    // Verification must succeed — hop 2 re-hashed over the post-drop set.
-    SDJWTVerifier::new(
-        after_hop2,
-        issuer_key_resolver(),
-        None,
-        None,
-        SDJWTSerializationFormat::Compact,
-    )
-    .expect("chain must verify after dropping last-segment disclosures");
+    // Verification must succeed — link 1 now discloses exactly one alternative,
+    // and hop 2 re-hashed over the post-drop set.
+    let verified = DelegateVerifier::verify(after_hop2, issuer_key_resolver(), None, None)
+        .expect("chain must verify after narrowing to one alternative");
+    assert_eq!(verified.delegate_payloads.len(), 2);
 }
 
 #[test]
@@ -739,17 +656,14 @@ fn redelegation_unknown_drop_target_errors() {
     let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
     let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
 
-    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
     let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
-    let delegate2_jwk: Jwk = serde_json::from_str(DELEGATE2_JWK).unwrap();
     let after_hop1 = holder
         .delegate(
-            json!({"scope": "x"}),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            vec![json!({"scope": "x", "cnf": cnf_claim(DELEGATE2_JWK)})],
             Some(Map::new()),
             None,
             holder_signing_key,
-            Some(delegate2_jwk),
             ChainBindingMode::IssuerJwtHash,
             None,
         )
@@ -758,20 +672,77 @@ fn redelegation_unknown_drop_target_errors() {
     let mut drops: HashSet<String> = HashSet::new();
     drops.insert("not-a-real-disclosure-string".to_string());
 
-    let mut delegate1 = SDJWTHolder::new(after_hop1, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 = DelegateHolder::load(after_hop1).unwrap();
     let delegate1_signing_key = EncodingKey::from_ed_pem(DELEGATE2_KEY_PEM.as_bytes()).unwrap();
     let result = delegate1.delegate(
-        json!({"hop": 2}),
-        ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        vec![json!({"hop": 2})],
         None,
         Some(drops),
         delegate1_signing_key,
-        None,
         ChainBindingMode::SdHash,
         Some("EdDSA".into()),
     );
     assert!(
         result.is_err(),
         "must reject a drop target that doesn't exist in the chain"
+    );
+}
+
+#[test]
+fn multi_alternative_select_and_present_round_trips() {
+    // A Holder signs TWO delegate_payload alternatives at once. The Delegate
+    // Holder selects one and presents it; the Verifier sees exactly that one.
+    let user_claims = json!({
+        "iss": "https://example.com/issuer",
+        "iat": 1683000000,
+        "exp": 1883000000,
+        "sub": "mona"
+    });
+    let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
+    let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
+
+    let mut holder = DelegateHolder::load(sd_jwt).unwrap();
+    let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
+
+    // Two terminal alternatives (no cnf) → kb+sd-jwt link, both as disclosures.
+    let dsd_jwt = holder
+        .delegate(
+            vec![
+                json!({"scope": "verifier-a"}),
+                json!({"scope": "verifier-b"}),
+            ],
+            Some(Map::new()),
+            None,
+            holder_signing_key,
+            ChainBindingMode::SdHash,
+            None,
+        )
+        .unwrap();
+
+    // Selecting alternative #1 and presenting reveals only "verifier-b".
+    let mut delegate = DelegateHolder::load(dsd_jwt.clone()).unwrap();
+    delegate.select_delegate_alternative(1);
+    let presentation = delegate.present(None, None, None, None).unwrap();
+
+    let verified = DelegateVerifier::verify(presentation, issuer_key_resolver(), None, None)
+        .expect("presentation with one selected alternative must verify");
+    assert_eq!(verified.delegate_payloads.len(), 1);
+    assert_eq!(
+        verified.claims.as_object().unwrap().get("scope"),
+        Some(&Value::String("verifier-b".into()))
+    );
+
+    // Presenting without selecting an alternative must error.
+    let delegate2 = DelegateHolder::load(dsd_jwt.clone()).unwrap();
+    assert!(
+        delegate2.present(None, None, None, None).is_err(),
+        "must require selecting one of multiple alternatives before presenting"
+    );
+
+    // And the freshly-delegated token (both alternatives disclosed) must fail the
+    // verifier's "exactly one disclosed" rule.
+    assert!(
+        DelegateVerifier::verify(dsd_jwt, issuer_key_resolver(), None, None).is_err(),
+        "a multi-alternative token with more than one disclosed must be rejected"
     );
 }

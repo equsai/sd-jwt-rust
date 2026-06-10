@@ -4,7 +4,6 @@
 
 use crate::{error, SDJWTJson, SDJWTSerializationFormat};
 use error::{Error, Result};
-use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -12,17 +11,9 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::time;
 
-use crate::delegate::{
-    compute_issuer_jwt_hash, compute_sd_hash, link_binding_mode, ChainBindingMode,
-};
-use crate::issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
 use crate::utils::base64_hash;
 use crate::SDJWTCommon;
-use crate::{
-    CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG, ISSUER_JWT_HASH_KEY,
-    KB_DIGEST_KEY, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER, SD_DIGESTS_KEY, SD_LIST_PREFIX,
-};
-use std::collections::HashSet;
+use crate::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG, KB_DIGEST_KEY};
 
 pub struct SDJWTHolder {
     sd_jwt_engine: SDJWTCommon,
@@ -50,6 +41,17 @@ impl SDJWTHolder {
     /// * `InvalidState` - If the SD JWT data is not valid
     /// * `DeserializationError` - If the SD JWT serialization is not valid
     pub fn new(sd_jwt_with_disclosures: String, serialization_format: SDJWTSerializationFormat) -> Result<Self> {
+        // This holder handles plain SD-JWT(+KB) only. A delegated SD-JWT must be
+        // loaded with `DelegateHolder`.
+        if serialization_format == SDJWTSerializationFormat::Compact
+            && crate::delegate::DelegationChain::try_parse_compact(&sd_jwt_with_disclosures)?
+                .is_some()
+        {
+            return Err(Error::InvalidInput(
+                "input is a delegated SD-JWT (dSD-JWT); use DelegateHolder".to_string(),
+            ));
+        }
+
         let mut holder = SDJWTHolder {
             sd_jwt_engine: SDJWTCommon {
                 serialization_format,
@@ -109,16 +111,12 @@ impl SDJWTHolder {
         self.key_binding_jwt_payload = Default::default();
         self.serialized_key_binding_jwt = Default::default();
 
-        // For a delegation chain, the Delegate Holder presents the chain as-is and
-        // (optionally) appends a final KB-JWT. `claims_to_disclose` does not apply at
-        // this layer — selective re-redaction across links is a future enhancement.
-        let is_chain = self.sd_jwt_engine.delegation_chain.is_some();
-        if !is_chain {
-            self.hs_disclosures =
-                self.select_disclosures(&self.sd_jwt_payload, claims_to_disclose)?;
-        } else {
-            self.hs_disclosures = Vec::new();
-        }
+        self.hs_disclosures = crate::selector::select_disclosures(
+            &self.sd_jwt_payload,
+            claims_to_disclose,
+            &self.sd_jwt_engine.hash_to_decoded_disclosure,
+            &self.sd_jwt_engine.hash_to_disclosure,
+        )?;
 
         match (nonce, aud, holder_key) {
             (Some(nonce), Some(aud), Some(holder_key)) => {
@@ -133,26 +131,12 @@ impl SDJWTHolder {
         }
 
         let sd_jwt_presentation = if self.sd_jwt_engine.serialization_format == SDJWTSerializationFormat::Compact {
-            if let Some(chain) = &self.sd_jwt_engine.delegation_chain {
-                let base = chain.serialize_for_final_kb_hash();
-                if self.serialized_key_binding_jwt.is_empty() {
-                    base
-                } else {
-                    format!("{}{}", base, self.serialized_key_binding_jwt)
-                }
-            } else {
-                let mut combined: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 2);
-                combined.push(&self.serialized_sd_jwt);
-                combined.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
-                combined.push(&self.serialized_key_binding_jwt);
-                combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
-            }
+            let mut combined: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 2);
+            combined.push(&self.serialized_sd_jwt);
+            combined.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
+            combined.push(&self.serialized_key_binding_jwt);
+            combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
         } else {
-            if is_chain {
-                return Err(Error::InvalidInput(
-                    "JSON serialization is not yet supported for delegation chains".into(),
-                ));
-            }
             let mut sd_jwt_json = self
                 .sd_jwt_json
                 .take()
@@ -168,154 +152,6 @@ impl SDJWTHolder {
         Ok(sd_jwt_presentation)
     }
 
-    fn select_disclosures(
-        &self,
-        sd_jwt_claims: &Map<String, Value>,
-        claims_to_disclose: Map<String, Value>,
-    ) -> Result<Vec<String>> {
-        let mut hash_to_disclosure = Vec::new();
-        let default_list = Vec::new();
-        let sd_map: HashMap<&str, (&Value, &str)> = sd_jwt_claims
-            .get(SD_DIGESTS_KEY)
-            .and_then(Value::as_array)
-            .unwrap_or(&default_list)
-            .iter()
-            .filter_map(|digest| {
-                let digest = digest.as_str()?;
-                let disclosure = self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)?;
-                let key = disclosure[1].as_str()?;
-                Some((key, (&disclosure[2], digest)))
-            })
-            .collect(); //TODO split to 2 maps
-        for (key_to_disclose, value_to_disclose) in claims_to_disclose {
-            match value_to_disclose {
-                Value::Bool(true) | Value::Number(_) | Value::String(_) => {
-                    /* disclose without children */
-                }
-                Value::Array(claims_to_disclose) => {
-                    if let Some(sd_jwt_claims) = sd_jwt_claims
-                        .get(&key_to_disclose)
-                        .and_then(Value::as_array)
-                    {
-                        hash_to_disclosure.append(
-                            &mut self.select_disclosures_from_disclosed_list(
-                                sd_jwt_claims,
-                                &claims_to_disclose,
-                            )?,
-                        )
-                    } else if let Some(sd_jwt_claims) = sd_map
-                        .get(key_to_disclose.as_str())
-                        .and_then(|(sd, _)| sd.as_array())
-                    {
-                        hash_to_disclosure.append(
-                            &mut self.select_disclosures_from_disclosed_list(
-                                sd_jwt_claims,
-                                &claims_to_disclose,
-                            )?,
-                        )
-                    }
-                }
-                Value::Object(claims_to_disclose) if (!claims_to_disclose.is_empty()) => {
-                    let sd_jwt_claims = if let Some(next) = sd_jwt_claims
-                        .get(&key_to_disclose)
-                        .and_then(Value::as_object)
-                    {
-                        next
-                    } else {
-                        sd_map[key_to_disclose.as_str()]
-                            .0
-                            .as_object()
-                            .ok_or(Error::ConversionError("json object".to_string()))?
-                    };
-                    hash_to_disclosure
-                        .append(&mut self.select_disclosures(sd_jwt_claims, claims_to_disclose)?);
-                }
-                Value::Object(_) => { /* disclose without children */ }
-                Value::Bool(false) | Value::Null => {
-                    // skip unrevealed
-                    continue;
-                }
-            }
-            if sd_jwt_claims.contains_key(&key_to_disclose) {
-                continue;
-            } else if let Some((_, digest)) = sd_map.get(key_to_disclose.as_str()) {
-                hash_to_disclosure.push(self.sd_jwt_engine.hash_to_disclosure[*digest].to_owned());
-            } else {
-                return Err(Error::InvalidState(
-                    "Requested claim doesn't exist".to_string(),
-                ));
-            }
-        }
-
-        Ok(hash_to_disclosure)
-    }
-
-    fn select_disclosures_from_disclosed_list(
-        &self,
-        sd_jwt_claims: &[Value],
-        claims_to_disclose: &[Value],
-    ) -> Result<Vec<String>> {
-        let mut hash_to_disclosure: Vec<String> = Vec::new();
-        for (claim_to_disclose, sd_jwt_claims) in claims_to_disclose.iter().zip(sd_jwt_claims) {
-            match (claim_to_disclose, sd_jwt_claims) {
-                (Value::Bool(true), Value::Object(sd_jwt_claims)) => {
-                    if let Some(Value::String(digest)) = sd_jwt_claims.get(SD_LIST_PREFIX) {
-                        hash_to_disclosure
-                            .push(self.sd_jwt_engine.hash_to_disclosure[digest].to_owned());
-                    }
-                }
-                (claim_to_disclose, Value::Object(sd_jwt_claims)) => {
-                    if let Some(Value::String(digest)) = sd_jwt_claims.get(SD_LIST_PREFIX) {
-                        let disclosure = self.sd_jwt_engine.hash_to_decoded_disclosure[digest]
-                            .as_array()
-                            .ok_or(Error::ConversionError("json array".to_string()))?;
-                        match (claim_to_disclose, disclosure.get(1)) {
-                            (
-                                Value::Array(claim_to_disclose),
-                                Some(Value::Array(sd_jwt_claims)),
-                            ) => {
-                                hash_to_disclosure.push(
-                                    self.sd_jwt_engine.hash_to_disclosure[digest].clone()
-                                );
-                                hash_to_disclosure.append(
-                                    &mut self.select_disclosures_from_disclosed_list(
-                                        sd_jwt_claims,
-                                        claim_to_disclose,
-                                    )?,
-                                );
-                            }
-                            (
-                                Value::Object(claim_to_disclose),
-                                Some(Value::Object(sd_jwt_claims)),
-                            ) => {
-                                hash_to_disclosure
-                                    .push(self.sd_jwt_engine.hash_to_disclosure[digest].to_owned());
-                                hash_to_disclosure.append(&mut self.select_disclosures(
-                                    sd_jwt_claims,
-                                    claim_to_disclose.to_owned(),
-                                )?);
-                            }
-                            _ => {}
-                        }
-                    } else if let Some(claim_to_disclose) = claim_to_disclose.as_object() {
-                        hash_to_disclosure.append(
-                            &mut self
-                                .select_disclosures(sd_jwt_claims, claim_to_disclose.to_owned())?,
-                        );
-                    }
-                }
-                (Value::Array(claim_to_disclose), Value::Array(sd_jwt_claims)) => {
-                    hash_to_disclosure.append(&mut self.select_disclosures_from_disclosed_list(
-                        sd_jwt_claims,
-                        claim_to_disclose,
-                    )?);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(hash_to_disclosure)
-    }
     fn create_key_binding_jwt(
         &mut self,
         nonce: String,
@@ -353,296 +189,18 @@ impl SDJWTHolder {
     }
 
     fn set_key_binding_digest_key(&mut self) -> Result<()> {
-        // For a delegation chain, the KB-JWT's sd_hash is computed over the entire
-        // chain serialization (issuer JWT + all chain links + their disclosures),
-        // NOT just the issuer JWT and its forwarded disclosures.
-        let combined: String = if let Some(chain) = &self.sd_jwt_engine.delegation_chain {
-            chain.serialize_for_final_kb_hash()
-        } else {
-            let mut parts: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 1);
-            parts.push(&self.serialized_sd_jwt);
-            parts.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
-            parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
-                .add(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
-        };
-
+        let mut parts: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 1);
+        parts.push(&self.serialized_sd_jwt);
+        parts.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
+        let combined = parts
+            .join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .add(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         let sd_hash = base64_hash(combined.as_bytes());
+
         self.key_binding_jwt_payload
             .insert(KB_DIGEST_KEY.to_owned(), Value::String(sd_hash));
 
         Ok(())
-    }
-
-    /// True if the loaded credential is a dSD-JWT or dSD-JWT+KB chain.
-    pub fn is_delegated(&self) -> bool {
-        self.sd_jwt_engine.delegation_chain.is_some()
-    }
-
-    /// Number of KB-SD-JWT links between the issuer-signed JWT and the holder's view.
-    /// Zero for a plain SD-JWT.
-    pub fn delegation_depth(&self) -> usize {
-        self.sd_jwt_engine
-            .delegation_chain
-            .as_ref()
-            .map_or(0, |c| c.links.len())
-    }
-
-    /// Produce a dSD-JWT by signing a KB-SD-JWT with this Holder's `cnf` key.
-    ///
-    /// Output is a Compact-form dSD-JWT (no trailing KB-JWT). To produce a
-    /// dSD-JWT+KB, the Delegate Holder downstream calls `create_presentation`
-    /// on the returned string with a non-empty `nonce`/`aud`/`holder_key`.
-    ///
-    /// # Arguments
-    ///
-    /// * `delegate_payload` — JSON object that becomes the Delegate Payload claims.
-    /// * `delegate_sd_strategy` — which Delegate Payload claims are selectively
-    ///   disclosable (same enum used at issuance time).
-    /// * `claims_to_disclose` — subset of the original SD-JWT's claims to forward
-    ///   to the Delegate Holder. Pass `None` together with
-    ///   `ChainBindingMode::IssuerJwtHash` to skip forwarded disclosures entirely.
-    /// * `holder_signing_key` — private key matching the **preceding** component's
-    ///   `cnf` (the issuer-signed JWT's `cnf` for a first-hop delegation).
-    /// * `delegate_cnf` — public key (JWK) of the **next-hop** Delegate Holder.
-    ///   `Some` → injects `cnf` into the Delegate Payload and uses
-    ///   `typ = kb+sd-jwt+kb` (enabling further delegation or a final KB-JWT).
-    ///   `None` → produces a terminal `kb+sd-jwt` link.
-    /// * `binding_mode` — `SdHash` (default) or `IssuerJwtHash`.
-    /// * `sign_alg` — JWS alg for the KB-SD-JWT (default: ES256).
-    ///
-    /// # Re-delegation
-    ///
-    /// If this holder loaded a credential that is itself a delegation chain
-    /// (`is_delegated()`), calling `delegate(...)` appends a new link to that
-    /// chain. The new link binds (via `sd_hash` / `issuer_jwt_hash`) to the
-    /// **last** existing link, and `holder_signing_key` MUST match that link's
-    /// `cnf`. `claims_to_disclose` is ignored in this mode — to drop predecessor
-    /// disclosures, use `drop_disclosures`.
-    ///
-    /// # `drop_disclosures` (re-delegation only)
-    ///
-    /// Set of disclosure strings (base64url payloads, exactly as they appear on
-    /// the wire) to remove from the forwarded chain. Each drop is permitted iff
-    /// the **already-signed** link that follows the disclosure's segment used
-    /// `issuer_jwt_hash` binding; otherwise dropping would invalidate that
-    /// link's hash and the call errors with `InvalidInput`. The disclosures of
-    /// the **last existing link** are always droppable here (this call signs the
-    /// link that commits to them, so the resulting hash can re-cover whatever
-    /// subset we forward). Ignored on first-hop delegation (use
-    /// `claims_to_disclose` to control forwarded issuer disclosures there).
-    ///
-    /// # Errors
-    ///
-    /// * `InvalidInput` — JSON serialization for chains (not yet supported); or
-    ///   `drop_disclosures` includes an entry not present in the chain, or an
-    ///   entry whose segment is frozen by a downstream `sd_hash`-bound link.
-    /// * `InvalidDelegatePayload` — `delegate_payload` is not a JSON object, or
-    ///   the caller put a `cnf` claim in `delegate_payload` while also passing
-    ///   `delegate_cnf = Some(_)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn delegate(
-        &mut self,
-        delegate_payload: Value,
-        delegate_sd_strategy: ClaimsForSelectiveDisclosureStrategy,
-        claims_to_disclose: Option<Map<String, Value>>,
-        drop_disclosures: Option<HashSet<String>>,
-        holder_signing_key: EncodingKey,
-        delegate_cnf: Option<Jwk>,
-        binding_mode: ChainBindingMode,
-        sign_alg: Option<String>,
-    ) -> Result<String> {
-        if self.sd_jwt_engine.serialization_format != SDJWTSerializationFormat::Compact {
-            return Err(Error::InvalidInput(
-                "JSON serialization for delegation chains is not yet supported".into(),
-            ));
-        }
-
-        let payload_obj = delegate_payload
-            .as_object()
-            .ok_or_else(|| {
-                Error::InvalidDelegatePayload("delegate_payload must be a JSON object".into())
-            })?
-            .clone();
-
-        if delegate_cnf.is_some() && payload_obj.contains_key(CNF_KEY) {
-            return Err(Error::InvalidDelegatePayload(
-                "delegate_payload must not contain a cnf claim when delegate_cnf is provided"
-                    .into(),
-            ));
-        }
-
-        let typ_header = if delegate_cnf.is_some() {
-            KB_SD_JWT_KB_TYP_HEADER.to_string()
-        } else {
-            KB_SD_JWT_TYP_HEADER.to_string()
-        };
-
-        // Determine (a) the parent JWT this new link binds to, (b) its disclosures
-        // (post-drop, for the new link's binding hash to commit to), and (c) the
-        // prefix bytes (everything that precedes the new link in the output
-        // serialization).
-        //
-        // First hop: parent = issuer JWT; prefix = issuer-jwt + forwarded disclosures.
-        // Re-delegation: parent = last chain link; prefix = full chain serialization,
-        // honoring `drop_disclosures` gated by per-segment droppability.
-        let (parent_jwt, parent_disclosures, prefix_parts): (String, Vec<String>, Vec<String>) =
-            match self.sd_jwt_engine.delegation_chain.clone() {
-                None => {
-                    let _ = drop_disclosures; // ignored on first-hop
-                    let forwarded: Vec<String> = match (binding_mode, claims_to_disclose) {
-                        (ChainBindingMode::IssuerJwtHash, None) => Vec::new(),
-                        (_, Some(claims)) => {
-                            let payload = self.sd_jwt_payload.clone();
-                            self.select_disclosures(&payload, claims)?
-                        }
-                        (ChainBindingMode::SdHash, None) => Vec::new(),
-                    };
-                    let mut prefix: Vec<String> = Vec::with_capacity(forwarded.len() + 1);
-                    prefix.push(self.serialized_sd_jwt.clone());
-                    prefix.extend(forwarded.iter().cloned());
-                    (self.serialized_sd_jwt.clone(), forwarded, prefix)
-                }
-                Some(chain) => {
-                    let _ = claims_to_disclose; // re-delegation uses drop_disclosures instead
-                    let drops: HashSet<String> = drop_disclosures.unwrap_or_default();
-                    let last_link = chain.links.last().ok_or_else(|| {
-                        Error::InvalidState(
-                            "delegation_chain is present but has no links".into(),
-                        )
-                    })?;
-
-                    // For each existing segment, decide whether its disclosures can
-                    // be dropped:
-                    //  - issuer segment      ← gated by chain.links[0]'s binding
-                    //  - chain.links[i] seg  ← gated by chain.links[i+1]'s binding
-                    //  - chain.links[last]   ← gated by OUR new link (we resign it,
-                    //                          post-drop, with `binding_mode`).
-                    fn segment_droppable(
-                        next_link_jwt: Option<&str>,
-                        our_binding: ChainBindingMode,
-                    ) -> bool {
-                        match next_link_jwt {
-                            Some(jwt) => {
-                                link_binding_mode(jwt)
-                                    == Some(ChainBindingMode::IssuerJwtHash)
-                            }
-                            None => {
-                                // No already-signed link constrains this segment; we
-                                // produce the next hash and can match whatever subset
-                                // we forward regardless of our binding mode.
-                                let _ = our_binding;
-                                true
-                            }
-                        }
-                    }
-
-                    let mut prefix: Vec<String> = Vec::new();
-                    let mut used_drops: HashSet<&String> = HashSet::new();
-
-                    // Issuer segment.
-                    prefix.push(chain.issuer_jwt.clone());
-                    let issuer_seg_droppable = segment_droppable(
-                        chain.links.first().map(|l| l.jwt.as_str()),
-                        binding_mode,
-                    );
-                    for d in &chain.issuer_disclosures {
-                        if drops.contains(d) {
-                            if !issuer_seg_droppable {
-                                return Err(Error::InvalidInput(format!(
-                                    "cannot drop disclosure from issuer segment: \
-                                     downstream link uses sd_hash binding which \
-                                     committed to it",
-                                )));
-                            }
-                            used_drops.insert(d);
-                        } else {
-                            prefix.push(d.clone());
-                        }
-                    }
-
-                    // Each existing chain link's segment. Insert the mandatory empty
-                    // component before each link to satisfy the dSD-JWT serialization
-                    // rule (empty component between an SD-JWT's last disclosure and
-                    // the following KB-SD-JWT).
-                    let mut last_link_filtered_disclosures: Vec<String> = Vec::new();
-                    for (i, link) in chain.links.iter().enumerate() {
-                        prefix.push(String::new());
-                        prefix.push(link.jwt.clone());
-                        let next_jwt = chain.links.get(i + 1).map(|l| l.jwt.as_str());
-                        let droppable = segment_droppable(next_jwt, binding_mode);
-                        for d in &link.disclosures {
-                            if drops.contains(d) {
-                                if !droppable {
-                                    return Err(Error::InvalidInput(format!(
-                                        "cannot drop disclosure from chain link {}: \
-                                         downstream link uses sd_hash binding which \
-                                         committed to it",
-                                        i
-                                    )));
-                                }
-                                used_drops.insert(d);
-                            } else {
-                                prefix.push(d.clone());
-                                if i + 1 == chain.links.len() {
-                                    last_link_filtered_disclosures.push(d.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    // Reject unrecognized drop targets — likely indicates a bug in the
-                    // caller (typo or stale reference); we'd rather error than silently
-                    // pass through.
-                    if used_drops.len() < drops.len() {
-                        let unmatched: Vec<&String> =
-                            drops.iter().filter(|d| !used_drops.contains(d)).collect();
-                        return Err(Error::InvalidInput(format!(
-                            "drop_disclosures contains {} entries not present in the \
-                             chain (e.g. {:?})",
-                            unmatched.len(),
-                            unmatched.first()
-                        )));
-                    }
-
-                    (
-                        last_link.jwt.clone(),
-                        last_link_filtered_disclosures,
-                        prefix,
-                    )
-                }
-            };
-
-        let binding_hash = match binding_mode {
-            ChainBindingMode::SdHash => compute_sd_hash(&parent_jwt, &parent_disclosures),
-            ChainBindingMode::IssuerJwtHash => compute_issuer_jwt_hash(&parent_jwt),
-        };
-        let binding_key = match binding_mode {
-            ChainBindingMode::SdHash => KB_DIGEST_KEY,
-            ChainBindingMode::IssuerJwtHash => ISSUER_JWT_HASH_KEY,
-        };
-        let mut extra_always_revealed: Map<String, Value> = Map::new();
-        extra_always_revealed.insert(binding_key.to_owned(), Value::String(binding_hash));
-
-        // Build the new KB-SD-JWT (signed with this party's `cnf` private key).
-        let mut kb_issuer = SDJWTIssuer::new(holder_signing_key, sign_alg);
-        let combined = kb_issuer.issue_sd_jwt_with_overrides(
-            Value::Object(payload_obj),
-            delegate_sd_strategy,
-            delegate_cnf,
-            false,
-            SDJWTSerializationFormat::Compact,
-            Some(typ_header),
-            extra_always_revealed,
-        )?;
-
-        // The new KB-SD-JWT is itself a chain link, so it MUST be preceded by an
-        // empty component (`~~` on the wire). The prefix's tail ends at the last
-        // disclosure of the preceding segment, so we append `~~<combined>`.
-        let prefix = prefix_parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
-        Ok(format!(
-            "{prefix}{sep}{sep}{combined}",
-            sep = COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
-        ))
     }
 }
 
@@ -938,73 +496,4 @@ mod tests {
         assert_eq!(presentation, expected);
     }
 
-    #[test]
-    fn delegate_produces_parseable_chain() {
-        use crate::delegate::{ChainBindingMode, DelegationChain};
-        use jsonwebtoken::jwk::Jwk;
-
-        let user_claims = json!({
-            "sub": "alice",
-            "iss": "https://example.com/issuer",
-            "iat": 1683000000,
-            "exp": 1883000000,
-            "address": { "country": "DE" }
-        });
-
-        // Issuer issues an SD-JWT with a holder cnf.
-        const HOLDER_JWK: &str = r#"{
-            "kty": "EC",
-            "crv": "P-256",
-            "x": "TCAER19Zvu3OHF4j4W4vfSVoHIP1ILilDls7vCeGemc",
-            "y": "ZxjiWWbZMQGHVWKVQ4hbSIirsVfuecCE6t4jT9F2HZQ"
-        }"#;
-        let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK).unwrap();
-        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None)
-            .issue_sd_jwt(
-                user_claims.clone(),
-                ClaimsForSelectiveDisclosureStrategy::AllLevels,
-                Some(holder_jwk),
-                false,
-                SDJWTSerializationFormat::Compact,
-            )
-            .unwrap();
-
-        // Holder delegates.
-        const HOLDER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
-        let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_PEM.as_bytes()).unwrap();
-
-        let mut holder =
-            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
-
-        let delegate_payload = json!({
-            "scope": "purchase",
-            "merchant": "example.com"
-        });
-
-        let dsd_jwt = holder
-            .delegate(
-                delegate_payload,
-                ClaimsForSelectiveDisclosureStrategy::AllLevels,
-                Some(user_claims.as_object().unwrap().clone()),
-                None,
-                holder_signing_key,
-                None,
-                ChainBindingMode::SdHash,
-                None,
-            )
-            .unwrap();
-
-        // The result must round-trip through the chain parser.
-        let chain = DelegationChain::try_parse_compact(&dsd_jwt).unwrap().unwrap();
-        assert_eq!(chain.links.len(), 1, "expected 1 chain link");
-        assert!(chain.trailing_kb_jwt.is_none(), "no final KB-JWT expected");
-        assert!(!chain.issuer_disclosures.is_empty(), "should have forwarded disclosures");
-        assert!(!chain.links[0].disclosures.is_empty(), "should have delegate disclosures");
-
-        // And loading it back via SDJWTHolder::new must surface as a chain.
-        let downstream = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
-        assert!(downstream.is_delegated());
-        assert_eq!(downstream.delegation_depth(), 1);
-    }
 }

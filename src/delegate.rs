@@ -12,8 +12,8 @@
 use crate::error::{Error, Result};
 use crate::utils::{base64_hash, base64url_decode};
 use crate::{
-    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, ISSUER_JWT_HASH_KEY, JWT_SEPARATOR, KB_DIGEST_KEY,
-    MAX_DELEGATION_DEPTH,
+    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DELEGATE_PAYLOAD_KEY, ISSUER_JWT_HASH_KEY,
+    JWT_SEPARATOR, KB_DIGEST_KEY, MAX_DELEGATION_DEPTH, SD_LIST_PREFIX,
 };
 
 /// How a KB-SD-JWT binds to the preceding component in the chain.
@@ -89,7 +89,9 @@ impl DelegationChain {
             if trailing_tilde {
                 (jwt_positions[1..].to_vec(), None)
             } else {
-                let last = *jwt_positions.last().unwrap();
+                let last = *jwt_positions.last().ok_or_else(|| {
+                    Error::ChainParseError("no JWT components found".to_string())
+                })?;
                 let mid: Vec<usize> = jwt_positions[1..]
                     .iter()
                     .copied()
@@ -228,22 +230,44 @@ impl DelegationChain {
         all
     }
 
-    /// Serialize the chain WITHOUT the trailing KB-JWT, ending in `~`. Used as the
-    /// hashed input for a final KB-JWT's `sd_hash` in a dSD-JWT+KB. Includes the
-    /// mandatory empty component before each chain-link KB-SD-JWT (same rule as
-    /// [`serialize_compact`]).
-    pub fn serialize_for_final_kb_hash(&self) -> String {
+    /// Serialize the chain for presentation, overriding the disclosures of the
+    /// final link with `last_link_disclosures` (the result of alternative
+    /// selection — keeping the chosen `delegate_payload` element's disclosure and
+    /// dropping the others). All preceding segments are emitted verbatim. Ends in
+    /// `~`, with the mandatory empty component before each chain-link KB-SD-JWT.
+    pub(crate) fn serialize_for_presentation(&self, last_link_disclosures: &[String]) -> String {
         let mut parts: Vec<&str> = Vec::new();
         parts.push(&self.issuer_jwt);
         parts.extend(self.issuer_disclosures.iter().map(|s| s.as_str()));
-        for link in &self.links {
+        let last_idx = self.links.len().saturating_sub(1);
+        for (i, link) in self.links.iter().enumerate() {
             parts.push(""); // mandatory empty component before each chain link
             parts.push(&link.jwt);
-            parts.extend(link.disclosures.iter().map(|s| s.as_str()));
+            if i == last_idx {
+                parts.extend(last_link_disclosures.iter().map(|s| s.as_str()));
+            } else {
+                parts.extend(link.disclosures.iter().map(|s| s.as_str()));
+            }
         }
         let mut s = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         s.push_str(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         s
+    }
+
+    /// `sd_hash` for a dSD-JWT+KB's final KB-JWT.
+    ///
+    /// Per the spec's verification step 5.2, the final KB-JWT binds to "the
+    /// proceeding SD-JWT or KB-SD-JWT+KB and it's disclosures" — i.e. the last
+    /// KB-SD-JWT link and the disclosures that follow it on the wire, NOT the
+    /// entire chain. This is the same construction the chain-link `sd_hash`
+    /// bindings use ([`compute_sd_hash`]), applied to the last link.
+    ///
+    /// Returns `None` only for a chain with no links (which cannot occur — a
+    /// parsed chain always has at least one link).
+    pub(crate) fn final_kb_sd_hash(&self) -> Option<String> {
+        self.links
+            .last()
+            .map(|l| compute_sd_hash(&l.jwt, &l.disclosures))
     }
 }
 
@@ -287,6 +311,40 @@ pub(crate) fn link_binding_mode(link_jwt: &str) -> Option<ChainBindingMode> {
         return Some(ChainBindingMode::IssuerJwtHash);
     }
     None
+}
+
+/// Read the `delegate_payload` array of a KB-SD-JWT link (without verifying its
+/// signature) and report, for each element in order, whether it is an
+/// array-element disclosure stub (`Some(digest)`) or an inline object
+/// (`None`). Returns `None` if the link has no parseable `delegate_payload`
+/// array. Used by the Delegate Holder to map an alternative index to the
+/// disclosure it must keep at presentation time.
+pub(crate) fn link_delegate_payload_stubs(link_jwt: &str) -> Option<Vec<Option<String>>> {
+    let parts: Vec<&str> = link_jwt.split(JWT_SEPARATOR).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let body_bytes = base64url_decode(parts[1]).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&body_bytes).ok()?;
+    let arr = payload
+        .as_object()?
+        .get(DELEGATE_PAYLOAD_KEY)?
+        .as_array()?;
+    Some(
+        arr.iter()
+            .map(|el| {
+                el.as_object().and_then(|o| {
+                    if o.len() == 1 {
+                        o.get(SD_LIST_PREFIX)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

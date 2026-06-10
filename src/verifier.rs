@@ -7,42 +7,27 @@ use crate::error::Error;
 use crate::error::Result;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
-use log::debug;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
 use std::ops::Add;
 use std::option::Option;
 use std::str::FromStr;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::delegate::{compute_issuer_jwt_hash, compute_sd_hash};
 use crate::utils::base64_hash;
 use crate::{
     SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
-    DEFAULT_SIGNING_ALG, DELEGATE_PAYLOAD_KEY, DIGEST_ALG_KEY, ISSUER_JWT_HASH_KEY, JWK_KEY,
-    KB_DIGEST_KEY, KB_JWT_TYP_HEADER, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER,
-    SD_DIGESTS_KEY, SD_LIST_PREFIX,
+    DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER,
 };
 
-type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
+pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
 
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
 
     sd_jwt_payload: Map<String, Value>,
     _holder_public_key_payload: Option<Map<String, Value>>,
-    duplicate_hash_check: Vec<String>,
     pub verified_claims: Value,
-
-    /// Per-link `cnf` JWKs extracted while walking a delegation chain. Empty for a
-    /// plain SD-JWT(+KB). Index 0 = first link's `cnf`, …, last entry = final
-    /// Delegate Holder (when present).
-    pub chain_cnfs: Vec<Jwk>,
-
-    /// Verified Delegate Payloads (unpacked) for each KB-SD-JWT in chain order.
-    /// Empty when the input is not a delegation chain.
-    pub verified_delegate_payloads: Vec<Map<String, Value>>,
 
     cb_get_issuer_key: Box<KeyResolver>,
 }
@@ -66,18 +51,25 @@ impl SDJWTVerifier {
         expected_nonce: Option<String>,
         serialization_format: SDJWTSerializationFormat,
     ) -> Result<Self> {
+        // This verifier handles plain SD-JWT(+KB) only. A delegated SD-JWT must be
+        // verified with `DelegateVerifier`.
+        if serialization_format == SDJWTSerializationFormat::Compact
+            && crate::delegate::DelegationChain::try_parse_compact(&sd_jwt_presentation)?.is_some()
+        {
+            return Err(Error::InvalidInput(
+                "input is a delegated SD-JWT (dSD-JWT); use DelegateVerifier".to_string(),
+            ));
+        }
+
         let mut verifier = SDJWTVerifier {
             sd_jwt_payload: serde_json::Map::new(),
             _holder_public_key_payload: None,
-            duplicate_hash_check: Vec::new(),
             cb_get_issuer_key,
             sd_jwt_engine: SDJWTCommon {
                 serialization_format,
                 ..Default::default()
             },
             verified_claims: Value::Null,
-            chain_cnfs: Vec::new(),
-            verified_delegate_payloads: Vec::new(),
         };
 
         verifier.sd_jwt_engine.parse_sd_jwt(sd_jwt_presentation)?;
@@ -85,10 +77,6 @@ impl SDJWTVerifier {
         let sign_alg = verifier.sd_jwt_engine.sign_alg.clone();
         verifier.verify_sd_jwt(sign_alg.clone())?;
         verifier.verified_claims = verifier.extract_sd_claims()?;
-
-        if verifier.sd_jwt_engine.delegation_chain.is_some() {
-            verifier.verify_delegation_chain()?;
-        }
 
         if let (Some(expected_aud), Some(expected_nonce)) = (&expected_aud, &expected_nonce) {
             let sign_alg = verifier.sd_jwt_engine.unverified_input_key_binding_jwt
@@ -227,14 +215,6 @@ impl SDJWTVerifier {
     }
 
     fn _get_key_binding_digest_hash(&mut self) -> Result<String> {
-        // For a delegation chain, the final KB-JWT's `sd_hash` is computed over the
-        // entire serialized chain (issuer JWT + all chain links + their disclosures),
-        // not just `<issuer-jwt>~<disclosures>~`.
-        if let Some(chain) = &self.sd_jwt_engine.delegation_chain {
-            let combined = chain.serialize_for_final_kb_hash();
-            return Ok(base64_hash(combined.as_bytes()));
-        }
-
         let mut combined: Vec<&str> =
             Vec::with_capacity(self.sd_jwt_engine.input_disclosures.len() + 1);
         combined.push(
@@ -256,274 +236,6 @@ impl SDJWTVerifier {
         Ok(base64_hash(combined.as_bytes()))
     }
 
-    /// Walk the delegation chain. Called after `verify_sd_jwt` has verified the
-    /// issuer-signed JWT and `extract_sd_claims` has produced the initial
-    /// `verified_claims`. Per-link Delegate Payloads are unpacked, signature- and
-    /// binding-verified, and layered onto `verified_claims`.
-    fn verify_delegation_chain(&mut self) -> Result<()> {
-        let chain = self
-            .sd_jwt_engine
-            .delegation_chain
-            .as_ref()
-            .ok_or_else(|| Error::InvalidState("delegation_chain absent".into()))?
-            .clone();
-
-        if chain.links.is_empty() {
-            return Ok(());
-        }
-
-        // Initial parent cnf = issuer-signed JWT's cnf claim.
-        let issuer_cnf_value = self
-            ._holder_public_key_payload
-            .as_ref()
-            .and_then(|p| p.get(JWK_KEY))
-            .cloned()
-            .ok_or_else(|| Error::ChainSignatureFailed {
-                link: 0,
-                reason: "issuer-signed JWT has no cnf.jwk for first chain link".into(),
-            })?;
-        let mut parent_cnf: Jwk = serde_json::from_value(issuer_cnf_value).map_err(|e| {
-            Error::ChainSignatureFailed {
-                link: 0,
-                reason: format!("issuer cnf.jwk parse: {}", e),
-            }
-        })?;
-
-        let mut parent_jwt = chain.issuer_jwt.clone();
-        let mut parent_disclosures = chain.issuer_disclosures.clone();
-        let trailing_kb_jwt_present = chain.trailing_kb_jwt.is_some();
-
-        for (idx, link) in chain.links.iter().enumerate() {
-            let is_last = idx + 1 == chain.links.len();
-
-            // 1. Verify signature using parent_cnf.
-            let alg_str = SDJWTCommon::decode_header_and_get_sign_algorithm(&link.jwt)
-                .unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
-            let alg = Algorithm::from_str(&alg_str).map_err(|e| {
-                Error::ChainSignatureFailed {
-                    link: idx,
-                    reason: e.to_string(),
-                }
-            })?;
-            let decoding_key = DecodingKey::from_jwk(&parent_cnf).map_err(|e| {
-                Error::ChainSignatureFailed {
-                    link: idx,
-                    reason: e.to_string(),
-                }
-            })?;
-            let mut validation = Validation::new(alg);
-            validation.set_required_spec_claims::<&str>(&[]);
-            validation.validate_aud = false;
-
-            let decoded = jsonwebtoken::decode::<Map<String, Value>>(
-                &link.jwt,
-                &decoding_key,
-                &validation,
-            )
-            .map_err(|e| Error::ChainSignatureFailed {
-                link: idx,
-                reason: e.to_string(),
-            })?;
-            let typ = decoded.header.typ.clone();
-            let payload = decoded.claims;
-
-            // 2. typ check.
-            let is_kb_only = typ.as_deref() == Some(KB_SD_JWT_TYP_HEADER);
-            let is_kb_kb = typ.as_deref() == Some(KB_SD_JWT_KB_TYP_HEADER);
-            if is_last && !trailing_kb_jwt_present {
-                if !is_kb_only && !is_kb_kb {
-                    return Err(Error::ChainTypMismatch {
-                        link: idx,
-                        found: typ,
-                        expected: "kb+sd-jwt or kb+sd-jwt+kb",
-                    });
-                }
-            } else {
-                // Intermediate link, OR last link of dSD-JWT+KB. Must be kb+sd-jwt+kb.
-                if !is_kb_kb {
-                    return Err(Error::ChainTypMismatch {
-                        link: idx,
-                        found: typ,
-                        expected: KB_SD_JWT_KB_TYP_HEADER,
-                    });
-                }
-            }
-
-            // 3. Binding validation.
-            let sd_hash_claim = payload.get(KB_DIGEST_KEY).and_then(Value::as_str);
-            let issuer_jwt_hash_claim = payload.get(ISSUER_JWT_HASH_KEY).and_then(Value::as_str);
-            match (sd_hash_claim, issuer_jwt_hash_claim) {
-                (Some(claimed), _) => {
-                    let computed = compute_sd_hash(&parent_jwt, &parent_disclosures);
-                    if claimed != computed {
-                        return Err(Error::InvalidChainBinding { link: idx });
-                    }
-                }
-                (None, Some(claimed)) => {
-                    let computed = compute_issuer_jwt_hash(&parent_jwt);
-                    if claimed != computed {
-                        return Err(Error::InvalidChainBinding { link: idx });
-                    }
-                }
-                (None, None) => {
-                    return Err(Error::MissingChainBinding { link: idx });
-                }
-            }
-
-            // 4. Unpack the Delegate Payload (resolves _sd / array stubs against the
-            // shared disclosure map). Use a per-link duplicate-hash check so digests
-            // exercised by the issuer payload don't collide with digests in this link.
-            self.duplicate_hash_check.clear();
-            let unpacked = self.unpack_disclosed_claims(&Value::Object(payload.clone()))?;
-            let unpacked_obj = unpacked
-                .as_object()
-                .cloned()
-                .ok_or_else(|| {
-                    Error::InvalidDelegatePayload(format!(
-                        "link {}: unpacked Delegate Payload is not an object",
-                        idx
-                    ))
-                })?;
-
-            // 5. Enforce delegate_payload "exactly one" rule, if the claim is present.
-            if payload.contains_key(DELEGATE_PAYLOAD_KEY) {
-                Self::enforce_delegate_payload_rule(idx, &payload, &unpacked_obj)?;
-            }
-
-            // 6. Layer unpacked claims onto verified_claims (link overrides issuer
-            // for collisions). Skip binding/typ-control claims from the layer.
-            let skip_keys: HashSet<&str> = [
-                KB_DIGEST_KEY,
-                ISSUER_JWT_HASH_KEY,
-                DIGEST_ALG_KEY,
-                SD_DIGESTS_KEY,
-            ]
-            .iter()
-            .copied()
-            .collect();
-            if let Value::Object(ref mut existing) = self.verified_claims {
-                for (k, v) in unpacked_obj.iter() {
-                    if !skip_keys.contains(k.as_str()) {
-                        existing.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            self.verified_delegate_payloads.push(unpacked_obj.clone());
-
-            // 7. Extract next-hop cnf for the next iteration, if applicable.
-            if is_kb_kb {
-                let cnf_value = unpacked_obj
-                    .get(CNF_KEY)
-                    .and_then(|c| c.as_object())
-                    .and_then(|c| c.get(JWK_KEY))
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidDelegatePayload(format!(
-                            "link {}: typ={} but cnf.jwk is missing from Delegate Payload",
-                            idx, KB_SD_JWT_KB_TYP_HEADER
-                        ))
-                    })?;
-                let next_jwk: Jwk = serde_json::from_value(cnf_value).map_err(|e| {
-                    Error::InvalidDelegatePayload(format!(
-                        "link {}: cnf.jwk parse: {}",
-                        idx, e
-                    ))
-                })?;
-                self.chain_cnfs.push(next_jwk.clone());
-                parent_cnf = next_jwk;
-            } else if !is_last {
-                // typ is kb+sd-jwt and we have more links — bug or malformed input.
-                return Err(Error::ChainTypMismatch {
-                    link: idx,
-                    found: typ,
-                    expected: "kb+sd-jwt+kb (non-final link must keep the chain bindable)",
-                });
-            }
-
-            parent_jwt = link.jwt.clone();
-            parent_disclosures = link.disclosures.clone();
-        }
-
-        // For dSD-JWT+KB, the trailing KB-JWT verifies against the last link's cnf.
-        // Patch `_holder_public_key_payload` so the existing KB-JWT verification path
-        // picks up the right key.
-        if trailing_kb_jwt_present {
-            let last_jwk = self.chain_cnfs.last().cloned().ok_or_else(|| {
-                Error::InvalidDelegatePayload(
-                    "trailing KB-JWT present but chain produced no cnf for final binding".into(),
-                )
-            })?;
-            let last_value = serde_json::to_value(&last_jwk).map_err(|e| {
-                Error::DeserializationError(format!("serialize last cnf: {}", e))
-            })?;
-            let mut map = Map::new();
-            map.insert(JWK_KEY.to_string(), last_value);
-            self._holder_public_key_payload = Some(map);
-        }
-
-        Ok(())
-    }
-
-    fn enforce_delegate_payload_rule(
-        link_idx: usize,
-        raw_payload: &Map<String, Value>,
-        unpacked_payload: &Map<String, Value>,
-    ) -> Result<()> {
-        let raw_arr = raw_payload
-            .get(DELEGATE_PAYLOAD_KEY)
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                Error::InvalidDelegatePayload(format!(
-                    "link {}: delegate_payload is not an array",
-                    link_idx
-                ))
-            })?;
-        if raw_arr.is_empty() {
-            return Err(Error::InvalidDelegatePayload(format!(
-                "link {}: delegate_payload is empty",
-                link_idx
-            )));
-        }
-        // Count digest stubs vs inline elements in the (pre-unpack) array.
-        let stub_count = raw_arr
-            .iter()
-            .filter(|v| {
-                v.as_object()
-                    .map_or(false, |obj| obj.contains_key(SD_LIST_PREFIX) && obj.len() == 1)
-            })
-            .count();
-        if stub_count > 0 && stub_count != raw_arr.len() {
-            return Err(Error::InvalidDelegatePayload(format!(
-                "link {}: delegate_payload mixes inline elements and digest stubs",
-                link_idx
-            )));
-        }
-        if stub_count == 0 && raw_arr.len() != 1 {
-            // Inline alternatives are only allowed when there is a single element;
-            // a multi-element disjunction MUST commit to digests so unselected
-            // alternatives stay opaque.
-            return Err(Error::InvalidDelegatePayload(format!(
-                "link {}: multi-alternative delegate_payload must use digest stubs",
-                link_idx
-            )));
-        }
-        if stub_count > 0 {
-            // After unpacking, exactly one alternative must have resolved.
-            let resolved = unpacked_payload
-                .get(DELEGATE_PAYLOAD_KEY)
-                .and_then(Value::as_array)
-                .map(|a| a.len())
-                .unwrap_or(0);
-            if resolved != 1 {
-                return Err(Error::InvalidDelegatePayload(format!(
-                    "link {}: delegate_payload must have exactly one disclosed alternative, got {}",
-                    link_idx, resolved
-                )));
-            }
-        }
-        Ok(())
-    }
-
     fn extract_sd_claims(&mut self) -> Result<Value> {
         if self.sd_jwt_payload.contains_key(DIGEST_ALG_KEY)
             && self.sd_jwt_payload[DIGEST_ALG_KEY] != DEFAULT_DIGEST_ALG
@@ -534,147 +246,13 @@ impl SDJWTVerifier {
             )));
         }
 
-        self.duplicate_hash_check = Vec::new();
         let claims: Value = self.sd_jwt_payload.clone().into_iter().collect();
-        self.unpack_disclosed_claims(&claims)
-    }
-
-    fn unpack_disclosed_claims(&mut self, sd_jwt_claims: &Value) -> Result<Value> {
-        match sd_jwt_claims {
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                Ok(sd_jwt_claims.to_owned())
-            }
-            Value::Array(arr) => {
-                self.unpack_disclosed_claims_in_array(arr)
-            }
-            Value::Object(obj) => {
-                self.unpack_disclosed_claims_in_object(obj)
-            }
-        }
-    }
-
-    fn unpack_disclosed_claims_in_array(&mut self, arr: &Vec<Value>) -> Result<Value> {
-        if arr.is_empty() {
-            return Err(Error::InvalidArrayDisclosureObject(
-                "Array of disclosed claims cannot be empty".to_string(),
-            ));
-        }
-
-        let mut claims = vec![];
-        for value in arr {
-
-            match value {
-                // case for SD objects in arrays
-                Value::Object(obj) if obj.contains_key(SD_LIST_PREFIX) => {
-                    if obj.len() > 1 {
-                        return Err(Error::InvalidDisclosure(
-                            "Disclosed claim object in an array maust contain only one key".to_string(),
-                        ));
-                    }
-
-                    let digest = obj.get(SD_LIST_PREFIX).unwrap();
-                    let disclosed_claim = self.unpack_from_digest(digest)?;
-                    if let Some(disclosed_claim) = disclosed_claim {
-                        claims.push(disclosed_claim);
-                    }
-                },
-                _ => {
-                    let claim = self.unpack_disclosed_claims(value)?;
-                    claims.push(claim);
-                },
-            }
-        }
-        Ok(Value::Array(claims))
-    }
-
-    fn unpack_disclosed_claims_in_object(&mut self, nested_sd_jwt_claims: &Map<String, Value>) -> Result<Value> {
-        let mut disclosed_claims: Map<String, Value> = serde_json::Map::new();
-
-        for (key, value) in nested_sd_jwt_claims {
-            if key != SD_DIGESTS_KEY && key != DIGEST_ALG_KEY {
-                disclosed_claims.insert(key.to_owned(), self.unpack_disclosed_claims(value)?);
-            }
-        }
-
-        if let Some(Value::Array(digest_of_disclosures)) = nested_sd_jwt_claims.get(SD_DIGESTS_KEY)
-        {
-            self.unpack_from_digests(&mut disclosed_claims, digest_of_disclosures)?;
-        }
-
-        Ok(Value::Object(disclosed_claims))
-    }
-
-    fn unpack_from_digests(
-        &mut self,
-        pre_output: &mut Map<String, Value>,
-        digests_of_disclosures: &Vec<Value>,
-    ) -> Result<()> {
-        for digest in digests_of_disclosures {
-            let digest = digest
-                .as_str()
-                .ok_or(Error::ConversionError("str".to_string()))?;
-            if self.duplicate_hash_check.contains(&digest.to_string()) {
-                return Err(Error::DuplicateDigestError(digest.to_string()));
-            }
-            self.duplicate_hash_check.push(digest.to_string());
-
-            if let Some(value_for_digest) =
-                self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)
-            {
-                let disclosure =
-                    value_for_digest
-                        .as_array()
-                        .ok_or(Error::InvalidArrayDisclosureObject(
-                            value_for_digest.to_string(),
-                        ))?;
-                let key = disclosure[1]
-                    .as_str()
-                    .ok_or(Error::ConversionError("str".to_string()))?
-                    .to_owned();
-                let value = disclosure[2].clone();
-                if pre_output.contains_key(&key) {
-                    return Err(Error::DuplicateKeyError(key.to_string()));
-                }
-                let unpacked_value = self.unpack_disclosed_claims(&value)?;
-                pre_output.insert(key, unpacked_value);
-            } else {
-                debug!("Digest {:?} skipped as decoy", digest)
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unpack_from_digest(
-        &mut self,
-        digest: &Value,
-    ) -> Result<Option<Value>> {
-        let digest = digest
-            .as_str()
-            .ok_or(Error::ConversionError("str".to_string()))?;
-        if self.duplicate_hash_check.contains(&digest.to_string()) {
-            return Err(Error::DuplicateDigestError(digest.to_string()));
-        }
-        self.duplicate_hash_check.push(digest.to_string());
-
-        if let Some(value_for_digest) =
-            self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)
-        {
-            let disclosure =
-                value_for_digest
-                    .as_array()
-                    .ok_or(Error::InvalidArrayDisclosureObject(
-                        value_for_digest.to_string(),
-                    ))?;
-
-            let value = disclosure[1].clone();
-            let unpacked_value = self.unpack_disclosed_claims(&value)?;
-            return Ok(Some(unpacked_value));
-        } else {
-            debug!("Digest {:?} skipped as decoy", digest)
-        }
-
-        Ok(None)
+        let mut seen = Vec::new();
+        crate::unpacker::unpack_disclosed_claims(
+            &claims,
+            &self.sd_jwt_engine.hash_to_decoded_disclosure,
+            &mut seen,
+        )
     }
 }
 
