@@ -748,3 +748,89 @@ fn multi_alternative_select_and_present_round_trips() {
         "a multi-alternative token with more than one disclosed must be rejected"
     );
 }
+
+// `exp` far in the past (2001-09-09). `nbf` far in the future (2100-01-01).
+const PAST_EXP: i64 = 1_000_000_000;
+const FUTURE_NBF: i64 = 4_102_444_800;
+
+fn delegate_with_lifetime(extra: Value) -> String {
+    let user_claims = json!({
+        "iss": "https://example.com/issuer",
+        "iat": 1683000000,
+        "exp": 1883000000, // issuer credential itself is still valid
+        "sub": "tina"
+    });
+    let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
+    let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk);
+
+    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let holder_signing_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
+
+    let mut payload = json!({ "scope": "x" });
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+
+    holder
+        .delegate(
+            vec![payload],
+            Some(Map::new()),
+            None,
+            holder_signing_key,
+            ChainBindingMode::SdHash,
+            None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn expired_delegate_payload_is_rejected() {
+    let dsd_jwt = delegate_with_lifetime(json!({ "exp": PAST_EXP }));
+    let result = SDJWTVerifier::new(
+        dsd_jwt,
+        issuer_key_resolver(),
+        None,
+        None,
+        SDJWTSerializationFormat::Compact,
+    );
+    assert!(
+        result.is_err(),
+        "verifier must reject a dSD-JWT whose Delegate Payload has expired"
+    );
+}
+
+#[test]
+fn not_yet_valid_delegate_payload_is_rejected() {
+    let dsd_jwt = delegate_with_lifetime(json!({ "nbf": FUTURE_NBF }));
+    let result = SDJWTVerifier::new(
+        dsd_jwt,
+        issuer_key_resolver(),
+        None,
+        None,
+        SDJWTSerializationFormat::Compact,
+    );
+    assert!(
+        result.is_err(),
+        "verifier must reject a dSD-JWT whose Delegate Payload is not yet valid (nbf in the future)"
+    );
+}
+
+#[test]
+fn valid_delegate_payload_lifetime_round_trips() {
+    // `exp` in the future, `nbf` in the past → currently valid.
+    let dsd_jwt = delegate_with_lifetime(json!({ "exp": 1883000000, "nbf": 1683000000 }));
+    let verified = SDJWTVerifier::new(
+        dsd_jwt,
+        issuer_key_resolver(),
+        None,
+        None,
+        SDJWTSerializationFormat::Compact,
+    )
+    .expect("a dSD-JWT whose Delegate Payload is within its validity window must verify");
+    assert_eq!(verified.verified_delegate_payloads.len(), 1);
+    assert_eq!(
+        verified.verified_claims.as_object().unwrap().get("scope"),
+        Some(&Value::String("x".into()))
+    );
+}

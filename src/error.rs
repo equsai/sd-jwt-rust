@@ -72,6 +72,12 @@ pub enum Error {
     #[error("invalid delegate payload: {0}")]
     InvalidDelegatePayload(String),
 
+    #[error("token lifetime invalid: {component} has expired (exp={exp})")]
+    ChainExpired { component: String, exp: i64 },
+
+    #[error("token lifetime invalid: {component} is not yet valid (nbf={nbf})")]
+    ChainNotYetValid { component: String, nbf: i64 },
+
     #[error("delegation chain depth {0} exceeds configured limit")]
     ChainDepthLimitExceeded(usize),
 

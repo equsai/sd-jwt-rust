@@ -178,6 +178,17 @@ impl SDJWTVerifier {
         let mut parent_disclosures = chain.issuer_disclosures.clone();
         let trailing_kb_jwt_present = chain.trailing_kb_jwt.is_some();
 
+        // The effective validity window of a dSD-JWT is the intersection of every
+        // component's `exp`/`nbf`: any party in the chain may narrow it, none may
+        // widen it. Snapshot `now` once so every component is checked against the
+        // same instant. The issuer-signed JWT's `exp` is also enforced by
+        // `jsonwebtoken` during `verify_sd_jwt`; re-checking here additionally
+        // covers its `nbf` and keeps the whole-chain check consistent.
+        let now = now_secs()?;
+        if let Some(issuer_claims) = self.verified_claims.as_object() {
+            validate_lifetime(issuer_claims, "issuer-signed JWT", now)?;
+        }
+
         for (idx, link) in chain.links.iter().enumerate() {
             let is_last = idx + 1 == chain.links.len();
 
@@ -266,6 +277,9 @@ impl SDJWTVerifier {
 
             // The single disclosed Delegate Payload is "the JWT Payload" for this link.
             let delegate_payload = disclosed_delegate_payload(idx, &unpacked_obj)?;
+
+            // Enforce this link's own lifetime (`exp`/`nbf`) before trusting it.
+            validate_lifetime(&delegate_payload, &format!("chain link {}", idx), now)?;
 
             // Layer the Delegate Payload's claims (link overrides issuer).
             if let Value::Object(ref mut existing) = self.verified_claims {
@@ -456,6 +470,54 @@ impl SDJWTVerifier {
             &mut seen,
         )
     }
+}
+
+/// Leeway (seconds) applied to `exp`/`nbf` checks, matching `jsonwebtoken`'s
+/// default so chain-component lifetime validation is consistent with the
+/// issuer-JWT validation done during `verify_sd_jwt`.
+const LIFETIME_LEEWAY_SECS: i64 = 60;
+
+/// Current time as seconds since the Unix epoch.
+fn now_secs() -> Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| Error::ConversionError(format!("system time before Unix epoch: {}", e)))
+}
+
+/// Read a NumericDate claim (`exp`/`nbf`). Accepts a JSON number (integer or
+/// truncated float) or a numeric string; returns `None` if the claim is absent or
+/// not a parseable timestamp.
+fn claim_timestamp(claims: &Map<String, Value>, key: &str) -> Option<i64> {
+    match claims.get(key) {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::String(s)) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Enforce a chain component's `exp`/`nbf` (if present) against `now`, with
+/// [`LIFETIME_LEEWAY_SECS`] of clock skew tolerance. `component` names the source
+/// (e.g. `"issuer-signed JWT"`, `"chain link 1"`) for error reporting.
+fn validate_lifetime(claims: &Map<String, Value>, component: &str, now: u64) -> Result<()> {
+    let now = now as i64;
+    if let Some(exp) = claim_timestamp(claims, "exp") {
+        if now > exp + LIFETIME_LEEWAY_SECS {
+            return Err(Error::ChainExpired {
+                component: component.to_string(),
+                exp,
+            });
+        }
+    }
+    if let Some(nbf) = claim_timestamp(claims, "nbf") {
+        if now + LIFETIME_LEEWAY_SECS < nbf {
+            return Err(Error::ChainNotYetValid {
+                component: component.to_string(),
+                nbf,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Verify the trailing KB-JWT of a dSD-JWT+KB against the final Delegate Holder's
