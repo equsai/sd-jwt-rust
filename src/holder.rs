@@ -109,6 +109,38 @@ impl SDJWTHolder {
         holder_key: Option<EncodingKey>,
         sign_alg: Option<String>,
     ) -> Result<String> {
+        // Delegation chain: present the chain with the selected final-link
+        // `delegate_payload` alternative, optionally appending a final KB-JWT
+        // (→ dSD-JWT+KB). `claims_to_disclose` does not apply here — the issuer
+        // claims forwarded into the chain were fixed at delegation time, and which
+        // alternative to disclose is chosen via `select_delegate_alternative`.
+        if let Some(chain) = self.sd_jwt_engine.delegation_chain.as_ref() {
+            let last = chain
+                .links
+                .last()
+                .ok_or_else(|| Error::InvalidState("delegation chain has no links".into()))?;
+            let kept = self.select_chain_alternative_disclosures()?;
+            let base = chain.serialize_for_presentation(&kept);
+
+            let kb_jwt = match (nonce, aud, holder_key) {
+                (Some(nonce), Some(aud), Some(holder_key)) => {
+                    let sd_hash = compute_sd_hash(&last.jwt, &kept);
+                    Some(build_kb_jwt(nonce, aud, &holder_key, sign_alg, sd_hash)?)
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(Error::InvalidInput(
+                        "Inconsistency in parameters to determine JWT KB by holder".to_string(),
+                    ))
+                }
+            };
+
+            return Ok(match kb_jwt {
+                Some(kb) => format!("{}{}", base, kb),
+                None => base,
+            });
+        }
+
         self.key_binding_jwt_header = Default::default();
         self.key_binding_jwt_payload = Default::default();
         self.serialized_key_binding_jwt = Default::default();
@@ -429,51 +461,6 @@ impl SDJWTHolder {
     /// for a single-alternative (inline) credential.
     pub fn select_delegate_alternative(&mut self, index: usize) {
         self.selected_alternative = Some(index);
-    }
-
-    /// Produce a presentation of the loaded dSD-JWT: the chain with exactly one
-    /// final-link `delegate_payload` alternative disclosed, optionally followed by a
-    /// KB-JWT proving possession of the final Delegate Holder's key.
-    ///
-    /// Pass all of `nonce`/`aud`/`holder_key` to append a KB-JWT (→ dSD-JWT+KB), or
-    /// none of them to present a bare dSD-JWT.
-    pub fn present(
-        &self,
-        nonce: Option<String>,
-        aud: Option<String>,
-        holder_key: Option<EncodingKey>,
-        sign_alg: Option<String>,
-    ) -> Result<String> {
-        let chain = self.sd_jwt_engine.delegation_chain.as_ref().ok_or_else(|| {
-            Error::InvalidInput(
-                "this credential is not delegated yet; nothing to present".to_string(),
-            )
-        })?;
-        let last = chain
-            .links
-            .last()
-            .ok_or_else(|| Error::InvalidState("delegation chain has no links".into()))?;
-
-        let kept = self.select_chain_alternative_disclosures()?;
-        let base = chain.serialize_for_presentation(&kept);
-
-        let kb_jwt = match (nonce, aud, holder_key) {
-            (Some(nonce), Some(aud), Some(holder_key)) => {
-                let sd_hash = compute_sd_hash(&last.jwt, &kept);
-                Some(build_kb_jwt(nonce, aud, &holder_key, sign_alg, sd_hash)?)
-            }
-            (None, None, None) => None,
-            _ => {
-                return Err(Error::InvalidInput(
-                    "Inconsistency in parameters to determine JWT KB by holder".to_string(),
-                ))
-            }
-        };
-
-        Ok(match kb_jwt {
-            Some(kb) => format!("{}{}", base, kb),
-            None => base,
-        })
     }
 
     /// Resolve the disclosures of the chain's final link to keep in a presentation

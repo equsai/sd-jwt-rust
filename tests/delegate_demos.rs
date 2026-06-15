@@ -221,7 +221,7 @@ fn dsd_jwt_with_kb_proof_of_possession_round_trips() {
         .unwrap();
 
     // Delegate Holder loads the dSD-JWT and creates a presentation with a final KB-JWT.
-    let delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
     assert!(delegate.is_delegated());
     assert_eq!(delegate.delegation_depth(), 1);
 
@@ -232,7 +232,8 @@ fn dsd_jwt_with_kb_proof_of_possession_round_trips() {
     let aud = "verifier.example".to_string();
 
     let presentation = delegate
-        .present(
+        .create_presentation(
+            Map::new(),
             Some(nonce.clone()),
             Some(aud.clone()),
             Some(delegate_signing_key),
@@ -337,13 +338,14 @@ fn final_kb_jwt_signed_with_wrong_key_fails() {
         )
         .unwrap();
 
-    let delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
     // Wrong: sign the final KB-JWT with the Holder's (P-256) key instead of
     // the Delegate Holder's (Ed25519) key.
     let wrong_key = EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap();
 
     let presentation = delegate
-        .present(
+        .create_presentation(
+            Map::new(),
             Some("n".into()),
             Some("a".into()),
             Some(wrong_key),
@@ -722,7 +724,7 @@ fn multi_alternative_select_and_present_round_trips() {
     // Selecting alternative #1 and presenting reveals only "verifier-b".
     let mut delegate = SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
     delegate.select_delegate_alternative(1);
-    let presentation = delegate.present(None, None, None, None).unwrap();
+    let presentation = delegate.create_presentation(Map::new(), None, None, None, None).unwrap();
 
     let verified = SDJWTVerifier::new(presentation, issuer_key_resolver(), None, None, SDJWTSerializationFormat::Compact)
         .expect("presentation with one selected alternative must verify");
@@ -733,9 +735,9 @@ fn multi_alternative_select_and_present_round_trips() {
     );
 
     // Presenting without selecting an alternative must error.
-    let delegate2 = SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate2 = SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
     assert!(
-        delegate2.present(None, None, None, None).is_err(),
+        delegate2.create_presentation(Map::new(), None, None, None, None).is_err(),
         "must require selecting one of multiple alternatives before presenting"
     );
 
