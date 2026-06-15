@@ -229,7 +229,7 @@ impl SDJWTVerifier {
             let sd_hash_claim = payload.get(KB_DIGEST_KEY).and_then(Value::as_str);
             let issuer_jwt_hash_claim = payload.get(ISSUER_JWT_HASH_KEY).and_then(Value::as_str);
             match (sd_hash_claim, issuer_jwt_hash_claim) {
-                (Some(claimed), _) => {
+                (Some(claimed), None) => {
                     if claimed != compute_sd_hash(&parent_jwt, &parent_disclosures) {
                         return Err(Error::InvalidChainBinding { link: idx });
                     }
@@ -240,6 +240,7 @@ impl SDJWTVerifier {
                     }
                 }
                 (None, None) => return Err(Error::MissingChainBinding { link: idx }),
+                (Some(_), Some(_)) => return Err(Error::AmbiguousChainBinding { link: idx }),
             }
 
             // Unpack the link payload against the shared disclosure map.

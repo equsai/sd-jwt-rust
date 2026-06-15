@@ -6,8 +6,6 @@
 //!
 //! Implements the chain types, compact-form tokenizer, and binding-hash helpers
 //! used by [`SDJWTHolder::delegate`] and the verifier chain walk.
-//!
-//! See `docs/delegate-sd-jwt-design.md` for the protocol-level design.
 
 use crate::error::{Error, Result};
 use crate::utils::{base64_hash, base64url_decode};

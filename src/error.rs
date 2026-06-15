@@ -63,6 +63,9 @@ pub enum Error {
     #[error("chain link {link} is missing both sd_hash and issuer_jwt_hash")]
     MissingChainBinding { link: usize },
 
+    #[error("chain link {link} contains both sd_hash and issuer_jwt_hash")]
+    AmbiguousChainBinding { link: usize },
+
     #[error("chain link {link} binding hash mismatch")]
     InvalidChainBinding { link: usize },
 
