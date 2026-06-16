@@ -4,7 +4,7 @@
 
 use crate::{error, SDJWTJson, SDJWTSerializationFormat};
 use error::{Error, Result};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, Header};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::ops::Add;
@@ -16,10 +16,11 @@ use crate::delegate::{
     ChainBindingMode,
 };
 use crate::disclosure::SDJWTDisclosure;
-use crate::utils::base64_hash;
+use crate::signer::SDJWTSigner;
+use crate::utils::{base64_hash, encode};
 use crate::SDJWTCommon;
 use crate::{
-    CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG,
+    CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
     DELEGATE_PAYLOAD_KEY, DIGEST_ALG_KEY, ISSUER_JWT_HASH_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER,
     KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER, SD_DIGESTS_KEY, SD_LIST_PREFIX,
 };
@@ -96,18 +97,16 @@ impl SDJWTHolder {
     /// * `claims_to_disclose` - Claims to disclose in the presentation
     /// * `nonce` - Nonce to be used in the key-binding JWT
     /// * `aud` - Audience to be used in the key-binding JWT
-    /// * `holder_key` - Key to sign the key-binding JWT
-    /// * `sign_alg` - Signing algorithm to be used in the key-binding JWT
+    /// * `signer` - Signer used to sign the key-binding JWT
     ///
     /// # Returns
     /// * `String` - Presentation in the format specified by `serialization_format` in the constructor. It can be either compact or json.
-    pub fn create_presentation(
+    pub async fn create_presentation<S: SDJWTSigner>(
         &mut self,
         claims_to_disclose: Map<String, Value>,
         nonce: Option<String>,
         aud: Option<String>,
-        holder_key: Option<EncodingKey>,
-        sign_alg: Option<String>,
+        signer: Option<S>,
     ) -> Result<String> {
         // Delegation chain: present the chain with the selected final-link
         // `delegate_payload` alternative, optionally appending a final KB-JWT
@@ -122,10 +121,10 @@ impl SDJWTHolder {
             let kept = self.select_chain_alternative_disclosures()?;
             let base = chain.serialize_for_presentation(&kept);
 
-            let kb_jwt = match (nonce, aud, holder_key) {
-                (Some(nonce), Some(aud), Some(holder_key)) => {
+            let kb_jwt = match (nonce, aud, signer) {
+                (Some(nonce), Some(aud), Some(signer)) => {
                     let sd_hash = compute_sd_hash(&last.jwt, &kept);
-                    Some(build_kb_jwt(nonce, aud, &holder_key, sign_alg, sd_hash)?)
+                    Some(build_kb_jwt(nonce, aud, signer, sd_hash).await?)
                 }
                 (None, None, None) => None,
                 _ => {
@@ -152,9 +151,9 @@ impl SDJWTHolder {
             &self.sd_jwt_engine.hash_to_disclosure,
         )?;
 
-        match (nonce, aud, holder_key) {
-            (Some(nonce), Some(aud), Some(holder_key)) => {
-                self.create_key_binding_jwt(nonce, aud, &holder_key, sign_alg)?
+        match (nonce, aud, signer) {
+            (Some(nonce), Some(aud), Some(signer)) => {
+                self.create_key_binding_jwt(nonce, aud, signer).await?
             }
             (None, None, None) => {}
             _ => {
@@ -186,14 +185,13 @@ impl SDJWTHolder {
         Ok(sd_jwt_presentation)
     }
 
-    fn create_key_binding_jwt(
+    async fn create_key_binding_jwt<S: SDJWTSigner>(
         &mut self,
         nonce: String,
         aud: String,
-        holder_key: &EncodingKey,
-        sign_alg: Option<String>,
+        signer: S,
     ) -> Result<()> {
-        let alg = sign_alg.unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
+        let alg = signer.algorithm().to_string();
         // Set key-binding fields
         self.key_binding_jwt_header
             .insert("alg".to_string(), alg.clone().into());
@@ -217,8 +215,7 @@ impl SDJWTHolder {
         );
         header.typ = Some(crate::KB_JWT_TYP_HEADER.into());
         self.serialized_key_binding_jwt =
-            jsonwebtoken::encode(&header, &self.key_binding_jwt_payload, holder_key)
-                .map_err(|e| Error::DeserializationError(e.to_string()))?;
+            encode(&header, &self.key_binding_jwt_payload, &signer).await?;
         Ok(())
     }
 
@@ -271,17 +268,16 @@ impl SDJWTHolder {
     ///   the forwarded chain (droppable iff no downstream `sd_hash`-bound link
     ///   committed to them; the last link's disclosures are always droppable). This
     ///   is also how a multi-alternative predecessor link is narrowed to one.
-    /// * `holder_signing_key` — private key matching the preceding component's `cnf`.
+    /// * `signer` — signer whose key matches the preceding component's `cnf`. Its
+    ///   [`SDJWTSigner::algorithm`] determines the KB-SD-JWT JWS alg.
     /// * `binding_mode` — `SdHash` or `IssuerJwtHash`.
-    /// * `sign_alg` — JWS alg for the KB-SD-JWT (default: ES256).
-    pub fn delegate(
+    pub async fn delegate<S: SDJWTSigner>(
         &mut self,
         delegate_payloads: Vec<Value>,
         claims_to_disclose: Option<Map<String, Value>>,
         drop_disclosures: Option<HashSet<String>>,
-        holder_signing_key: EncodingKey,
+        signer: S,
         binding_mode: ChainBindingMode,
-        sign_alg: Option<String>,
     ) -> Result<String> {
         if delegate_payloads.is_empty() {
             return Err(Error::InvalidDelegatePayload(
@@ -438,13 +434,13 @@ impl SDJWTHolder {
         };
 
         let combined = sign_kb_sd_jwt_link(
-            &holder_signing_key,
-            sign_alg.as_deref(),
+            &signer,
             &typ_header,
             delegate_payloads,
             binding_key,
             binding_hash,
-        )?;
+        )
+        .await?;
 
         // The new KB-SD-JWT is a chain link, so it MUST be preceded by an empty
         // component (`~~` on the wire).
@@ -560,6 +556,12 @@ fn select_disclosures(
         .collect(); //TODO split to 2 maps
     for (key_to_disclose, value_to_disclose) in claims_to_disclose {
         match value_to_disclose {
+            Value::String(optional)
+                if optional.as_str() == "optional"
+                    && !sd_map.contains_key(key_to_disclose.as_str()) =>
+            {
+                continue
+            }
             Value::Bool(true) | Value::Number(_) | Value::String(_) => {
                 /* disclose without children */
             }
@@ -593,7 +595,12 @@ fn select_disclosures(
                 {
                     next
                 } else {
-                    sd_map[key_to_disclose.as_str()]
+                    sd_map
+                        .get(key_to_disclose.as_str())
+                        .ok_or(Error::KeyNotFound(format!(
+                            "Disclosure with key = '{}' is not found",
+                            key_to_disclose
+                        )))?
                         .0
                         .as_object()
                         .ok_or(Error::ConversionError("json object".to_string()))?
@@ -616,9 +623,9 @@ fn select_disclosures(
         } else if let Some((_, digest)) = sd_map.get(key_to_disclose.as_str()) {
             hash_to_disclosure.push(hash_to_raw[*digest].to_owned());
         } else {
-            return Err(Error::InvalidState(
-                "Requested claim doesn't exist".to_string(),
-            ));
+            return Err(Error::InvalidState(format!(
+                "Requested claim '{key_to_disclose}' doesn't exist"
+            )));
         }
     }
 
@@ -692,9 +699,8 @@ fn select_disclosures_from_disclosed_list(
 /// Sign one KB-SD-JWT chain link with a Holder's `cnf` private key and serialize it
 /// compactly (`<jwt>~<d1>~...~<dn>~`). The link signer lives here (not on
 /// `SDJWTIssuer`) because a chain link is signed by a Holder, not the Issuer.
-fn sign_kb_sd_jwt_link(
-    signing_key: &EncodingKey,
-    sign_alg: Option<&str>,
+async fn sign_kb_sd_jwt_link<S: SDJWTSigner>(
+    signer: &S,
     typ_header: &str,
     delegate_payloads: Vec<Value>,
     binding_key: &str,
@@ -737,13 +743,12 @@ fn sign_kb_sd_jwt_link(
     );
     payload.insert(binding_key.to_owned(), Value::String(binding_hash));
 
-    let alg = sign_alg.unwrap_or(DEFAULT_SIGNING_ALG);
+    let alg = signer.algorithm();
     let mut header = Header::new(
         Algorithm::from_str(alg).map_err(|e| Error::DeserializationError(e.to_string()))?,
     );
     header.typ = Some(typ_header.to_string());
-    let jwt = jsonwebtoken::encode(&header, &payload, signing_key)
-        .map_err(|e| Error::DeserializationError(e.to_string()))?;
+    let jwt = encode(&header, &payload, signer).await?;
 
     let mut parts: Vec<String> = Vec::with_capacity(disclosures.len() + 1);
     parts.push(jwt);
@@ -756,14 +761,13 @@ fn sign_kb_sd_jwt_link(
 }
 
 /// Build a final KB-JWT (`typ=kb+jwt`) binding `sd_hash` to the presented chain.
-fn build_kb_jwt(
+async fn build_kb_jwt<S: SDJWTSigner>(
     nonce: String,
     aud: String,
-    holder_key: &EncodingKey,
-    sign_alg: Option<String>,
+    signer: S,
     sd_hash: String,
 ) -> Result<String> {
-    let alg = sign_alg.unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
+    let alg = signer.algorithm().to_string();
     let mut payload: Map<String, Value> = Map::new();
     payload.insert("nonce".to_string(), Value::String(nonce));
     payload.insert("aud".to_string(), Value::String(aud));
@@ -778,8 +782,7 @@ fn build_kb_jwt(
         Algorithm::from_str(&alg).map_err(|e| Error::DeserializationError(e.to_string()))?,
     );
     header.typ = Some(KB_JWT_TYP_HEADER.to_string());
-    jsonwebtoken::encode(&header, &payload, holder_key)
-        .map_err(|e| Error::DeserializationError(e.to_string()))
+    encode(&header, &payload, &signer).await
 }
 
 #[cfg(test)]
@@ -789,11 +792,21 @@ mod tests {
     use jsonwebtoken::EncodingKey;
     use serde_json::{json, Map, Value};
     use std::collections::HashSet;
+    use async_std_test::async_test;
+    use crate::key::SDJWTKey;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
+    const PRIVATE_HOLDER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg0tI02eGRti3I3oVD\nJNJPjnqZPLoTgb1LjAKHghdHS6ihRANCAATcyYx2XscFQm+cq9hXjzhP+IhocalY\nWuBJDqoAjF1BtV159qmKAVtBk1RkN4rVlwGCvHElWbqzXQmbzi/psban\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_HOLDER_JWK: &str = r#"{
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "3MmMdl7HBUJvnKvYV484T_iIaHGpWFrgSQ6qAIxdQbU",
+            "y": "XXn2qYoBW0GTVGQ3itWXAYK8cSVZurNdCZvOL-mxtqc",
+            "d": "0tI02eGRti3I3oVDJNJPjnqZPLoTgb1LjAKHghdHS6g"
+         }"#;
 
-    #[test]
-    fn create_full_presentation() {
+    #[async_test]
+    async fn create_full_presentation() -> std::io::Result<()> {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -807,32 +820,37 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
-            .unwrap();
+            .await.unwrap();
         let presentation = SDJWTHolder::new(
             sd_jwt.clone(),
             SDJWTSerializationFormat::Compact,
         )
             .unwrap()
-            .create_presentation(
+            .create_presentation::<SDJWTKey>(
                 user_claims.as_object().unwrap().clone(),
                 None,
                 None,
                 None,
-                None,
             )
-            .unwrap();
+            .await.unwrap();
         assert_eq!(sd_jwt, presentation);
+
+        Ok(())
     }
-    #[test]
-    fn create_presentation_empty_object_as_disclosure_value() {
+    #[async_test]
+    async fn create_presentation_empty_object_as_disclosure_value() -> std::io::Result<()> {
         let mut user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -846,43 +864,96 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
 
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
-            .unwrap();
+            .await.unwrap();
         let issued = sd_jwt.clone();
         user_claims["address"] = Value::Object(Map::new());
+        user_claims["email"] = Value::Bool(false);
         let presentation =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation::<SDJWTKey>(
                     user_claims.as_object().unwrap().clone(),
                     None,
                     None,
                     None,
-                    None,
                 )
-                .unwrap();
+                .await.unwrap();
 
         let mut parts: Vec<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
+
+        parts.remove(6);
         parts.remove(5);
         parts.remove(4);
         parts.remove(3);
-        parts.remove(2);
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
+
+        Ok(())
     }
 
-    #[test]
-    fn create_presentation_for_arrayed_disclosures() {
+    #[async_test]
+    #[should_panic(expected = "Disclosure with key = 'email' is not found")]
+    async fn create_presentation_with_non_existing_key_in_disclosures() -> std::io::Result<()> {
+        let mut user_claims = json!({
+            "birthdate": ["1955-04-12"],
+            "family_name": "Neal",
+            "given_name": "Tyler",
+            "username": "tneal",
+            "email": "tyler.neal@example.com",
+            "iss": "did:key:zDnaeWEtv3fqyb8tTY7NGysY8RavUrhYtFe6qd9eddRWkSDFw",
+            "iat": 1730118723,
+            "exp": 1761654723,
+        });
+        let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
+            user_claims.clone(),
+            ClaimsForSelectiveDisclosureStrategy::Custom(vec!["$.given_name", "$.family_name", "$.username", "$.email.work"]),
+            None,
+            false,
+            SDJWTSerializationFormat::Compact,
+            None
+        )
+            .await.unwrap();
+        // Choose what to reveal
+        user_claims["given_name"] = Value::Bool(true);
+        user_claims["family_name"] = Value::Bool(true);
+        user_claims["username"] = Value::Bool(true);
+        user_claims["email"] = Value::Object(serde_json::Map::from_iter([("work".to_string(), Value::Bool(true))]));
+
+        let _ =
+            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+                .unwrap()
+                .create_presentation::<SDJWTKey>(
+                    user_claims.as_object().unwrap().clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await.unwrap();
+        Ok(())
+    }
+
+    #[async_test]
+    async fn create_presentation_for_arrayed_disclosures() -> std::io::Result<()> {
         let mut user_claims = json!(
             {
               "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
@@ -915,15 +986,19 @@ mod tests {
         ]);
 
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims.clone(),
             strategy,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            None,
         )
-            .unwrap();
+            .await.unwrap();
         // Choose what to reveal
         user_claims["addresses"] = Value::Array(vec![Value::Bool(true), Value::Bool(false)]);
         user_claims["nationalities"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
@@ -933,14 +1008,13 @@ mod tests {
         let presentation =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation::<SDJWTKey>(
                     user_claims.as_object().unwrap().clone(),
                     None,
                     None,
                     None,
-                    None,
                 )
-                .unwrap();
+                .await.unwrap();
         println!("{}", presentation);
         let mut issued_parts: HashSet<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
@@ -954,10 +1028,12 @@ mod tests {
 
         let union: HashSet<_> = issued_parts.intersection(&revealed_parts).collect();
         assert_eq!(union.len(), 3);
+
+        Ok(())
     }
 
-    #[test]
-    fn create_presentation_for_recursive_disclosures() {
+    #[async_test]
+    async fn create_presentation_for_recursive_disclosures() -> std::io::Result<()> {
         // Input data used to create the SD-JWT and presentation fixtures,
         // can be used to debug in case the test fails:
 
@@ -1054,14 +1130,13 @@ mod tests {
         let presentation =
             SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation::<SDJWTKey>(
                     revealed.as_object().unwrap().clone(),
                     None,
                     None,
                     None,
-                    None,
                 )
-                .unwrap();
+                .await.unwrap();
 
         let presentation: HashSet<_> = presentation
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR).map(String::from)
@@ -1072,6 +1147,181 @@ mod tests {
             .map(String::from).collect();
 
         assert_eq!(presentation, expected);
+
+        Ok(())
     }
 
+    #[async_test]
+    async fn create_presentation_with_optional_claims_to_reveal() -> std::io::Result<()> {
+        let sd_jwt = String::from("eyJhbGciOiJFUzI1NiJ9.eyJmb28iOlt7Ii4uLiI6Ii1XMWROTk0tNUI3WlpxR3R4MkF6RTA3X0hpRUpOZVJtNGtEQ1VORTVDNFUifSx7Ii4uLiI6ImpuUURqUEFoclY1bjMtRW5PVEZHWTcwMkd0T3FhN3hua3pVM0E4aElSX3cifV0sImJhciI6eyJfc2QiOlsiX25yZUxad2xVYlp1SmtqS1RVdHR5YkhqUTNrY2J4cnZab1dxUmVBbG4tcyIsImhGcjdBRElQbjZvQ3lSckNBN0VtNldLaGk1UjdXMWJjYWFZUFFrelpGMXciXX0sInF1eCI6W3siLi4uIjoieHl6MkRSSDRTSkpjdFFtMDEtSzROVVllMTMzMWh6U3VkTXd3MENDODEyUSJ9XSwiYmF6IjpbeyIuLi4iOiJRMGcyVmYzNnl6TnNvUkdNb0dsODZnZ2QyWGFVTmg5bGN6STFfbmFZYUhnIn0seyIuLi4iOiJZcGpMNTJKd1BfYmFFS21OaHFLazE3TWFrMl9fSWJCNmctY0haSHd6dmwwIn1dLCJhbmltYWxzIjp7Il9zZCI6WyJyQ19LNzlObG95SkFPWXRCOW9ITFlsTVJSS1V4UTNnaTZ0Wld0Zm90TWRjIiwidjUyd3d6bzB5Ymw2U2V1MjZWYklUODh5bHk1LXVMZkdlYTdkWnMxSHBwMCJdfSwiX3NkX2FsZyI6InNoYS0yNTYifQ.piidRp0pHJYmtExCJnLExaaWMTBX50mLwM6gFVYnD72DszyjpKbAoZhyAXT-I4CqqSpiHZg-2w8s26XBraqX6w~WyJCQ2k5UXlsWVVqVEpXWWVfbzRzOWxnIiwgIm9uZSJd~WyJSLXZ0bDBmbWF6N01zR1ZWRFh3T3BnIiwgInR3byJd~WyJXNWlOQ1Z1Qlo4OW9aV2dIUkxzRWJBIiwgInJlZCIsIDFd~WyJTQW5hNUJnaHJxUXJ0amR5SGxiejJBIiwgImdyZWVuIiwgMl0~WyJENVJrNVlIUkdJVXM5enp6OFUtOTVnIiwgImJsdWUiXQ~WyI0Y2tnSjJuWVhhV21jM3pVQ253d3N3IiwgInllbGxvdyJd~WyJ2Ml8tRG5JN0lEZ1loYVMzTG9Kb013IiwgW3siLi4uIjogIkhqMUQtZE1SNXR0YmpLcl9DUENETzRuVGlkTWR1YVNpMnlnYlhtcmR4MGcifSwgeyIuLi4iOiAiUl9Sb253SFY3bzR6Y0o3TV9jcTlobVpLZ2o2RkMtdmNXTko4bzNkeTg2MCJ9XV0~WyJwRHQtcEtfaklUYXhCVENJRFNvUnhBIiwgIm9yYW5nZSJd~WyJ1b3FDS0lpZGJzQmxhczhUaU5Kakh3IiwgInB1cnBsZSJd~WyJJWWFXMzVPNzBoUWg4OGlqWVBUVXZRIiwgW3siLi4uIjogIjlWdnFSbjk1ZUN6QnVkNkhYOG1faVRNMERZSVVxN0ZheFFtanowV1llbUkifSwgeyIuLi4iOiAiTmFOeXozWEJRZVc4Z1JRd28ySlN5NmhtbnJZT1JxRjMxeUhfWkhqbkRxNCJ9XV0~WyI4cFNkNHl0TWlPdnVGaFhQSXBPbW5BIiwgImJsYWNrIl0~WyJxLWR0QXhtZzY5cWZLMFpvS1BSbWFnIiwgIndoaXRlIl0~WyIzTzY0WmVYSjF6XzJWMXdrMGhJdUdBIiwgW3siLi4uIjogImRmVnVjbkwwMC1FVFh0RGpHaDlpRHYtSE5PZmRyZ1VuTlNYRk01VUlIRVkifSwgeyIuLi4iOiAiUlRnVmxQb25RTVZJNkEzNUJic21KTThDeDVTVTN1ZXJBMENyYmpvRW02USJ9XV0~WyJNQTlSbGMwUlAxNnVJWER6blRqOWJ3IiwgIm5hbWUiLCAicHl0aG9uIl0~WyJrblRLb0lKVzZuQ1VzeW1sN3lKWTNBIiwgImFnZSIsIDEwXQ~WyJlUEdwazZjdEhOSS1HS2JKbjZrR3lBIiwgInNuYWtlIiwgeyJfc2QiOiBbIjREU0s5REpJVEhROElITFFESld6SV9yM0lheXBIek5Ma19tc3BUa2xDVzQiLCAiYy11UFhEQkZJX2FDV1BUUHlYNFV0OWdDWW1DQ1FqUEw5TnRFZGotdWZtMCJdfV0~WyJOMzgyX2xTU1dpSzZsbGdPNFFhbUdnIiwgIm5hbWUiLCAiZWFnbGUiXQ~WyJjVWZVRVBrX0pDZm1KQzhWQUp1V1pBIiwgImFnZSIsIDIwXQ~WyJSVDh5My1Odmh6QXo4Q2ctS1NDRGh3IiwgImJpcmQiLCB7Il9zZCI6IFsiUVhINU9mSF8tMGtFYkEwWDBnd0RLenphc05ZYWRWekNWRGFrYlZfWnNxNCIsICJoUmtPNjRIVXZuaEFPbDBRS1NlZDFUWUhtb0VpRW9zb0R0WmsyRVl4ejdNIl19XQ~");
+        let expected_presentation = String::from("eyJhbGciOiJFUzI1NiJ9.eyJmb28iOlt7Ii4uLiI6Ii1XMWROTk0tNUI3WlpxR3R4MkF6RTA3X0hpRUpOZVJtNGtEQ1VORTVDNFUifSx7Ii4uLiI6ImpuUURqUEFoclY1bjMtRW5PVEZHWTcwMkd0T3FhN3hua3pVM0E4aElSX3cifV0sImJhciI6eyJfc2QiOlsiX25yZUxad2xVYlp1SmtqS1RVdHR5YkhqUTNrY2J4cnZab1dxUmVBbG4tcyIsImhGcjdBRElQbjZvQ3lSckNBN0VtNldLaGk1UjdXMWJjYWFZUFFrelpGMXciXX0sInF1eCI6W3siLi4uIjoieHl6MkRSSDRTSkpjdFFtMDEtSzROVVllMTMzMWh6U3VkTXd3MENDODEyUSJ9XSwiYmF6IjpbeyIuLi4iOiJRMGcyVmYzNnl6TnNvUkdNb0dsODZnZ2QyWGFVTmg5bGN6STFfbmFZYUhnIn0seyIuLi4iOiJZcGpMNTJKd1BfYmFFS21OaHFLazE3TWFrMl9fSWJCNmctY0haSHd6dmwwIn1dLCJhbmltYWxzIjp7Il9zZCI6WyJyQ19LNzlObG95SkFPWXRCOW9ITFlsTVJSS1V4UTNnaTZ0Wld0Zm90TWRjIiwidjUyd3d6bzB5Ymw2U2V1MjZWYklUODh5bHk1LXVMZkdlYTdkWnMxSHBwMCJdfSwiX3NkX2FsZyI6InNoYS0yNTYifQ.piidRp0pHJYmtExCJnLExaaWMTBX50mLwM6gFVYnD72DszyjpKbAoZhyAXT-I4CqqSpiHZg-2w8s26XBraqX6w~WyJSLXZ0bDBmbWF6N01zR1ZWRFh3T3BnIiwgInR3byJd~WyJTQW5hNUJnaHJxUXJ0amR5SGxiejJBIiwgImdyZWVuIiwgMl0~WyI0Y2tnSjJuWVhhV21jM3pVQ253d3N3IiwgInllbGxvdyJd~WyJ2Ml8tRG5JN0lEZ1loYVMzTG9Kb013IiwgW3siLi4uIjogIkhqMUQtZE1SNXR0YmpLcl9DUENETzRuVGlkTWR1YVNpMnlnYlhtcmR4MGcifSwgeyIuLi4iOiAiUl9Sb253SFY3bzR6Y0o3TV9jcTlobVpLZ2o2RkMtdmNXTko4bzNkeTg2MCJ9XV0~WyJ1b3FDS0lpZGJzQmxhczhUaU5Kakh3IiwgInB1cnBsZSJd~WyJJWWFXMzVPNzBoUWg4OGlqWVBUVXZRIiwgW3siLi4uIjogIjlWdnFSbjk1ZUN6QnVkNkhYOG1faVRNMERZSVVxN0ZheFFtanowV1llbUkifSwgeyIuLi4iOiAiTmFOeXozWEJRZVc4Z1JRd28ySlN5NmhtbnJZT1JxRjMxeUhfWkhqbkRxNCJ9XV0~WyI4cFNkNHl0TWlPdnVGaFhQSXBPbW5BIiwgImJsYWNrIl0~WyJxLWR0QXhtZzY5cWZLMFpvS1BSbWFnIiwgIndoaXRlIl0~WyIzTzY0WmVYSjF6XzJWMXdrMGhJdUdBIiwgW3siLi4uIjogImRmVnVjbkwwMC1FVFh0RGpHaDlpRHYtSE5PZmRyZ1VuTlNYRk01VUlIRVkifSwgeyIuLi4iOiAiUlRnVmxQb25RTVZJNkEzNUJic21KTThDeDVTVTN1ZXJBMENyYmpvRW02USJ9XV0~WyJrblRLb0lKVzZuQ1VzeW1sN3lKWTNBIiwgImFnZSIsIDEwXQ~WyJlUEdwazZjdEhOSS1HS2JKbjZrR3lBIiwgInNuYWtlIiwgeyJfc2QiOiBbIjREU0s5REpJVEhROElITFFESld6SV9yM0lheXBIek5Ma19tc3BUa2xDVzQiLCAiYy11UFhEQkZJX2FDV1BUUHlYNFV0OWdDWW1DQ1FqUEw5TnRFZGotdWZtMCJdfV0~WyJjVWZVRVBrX0pDZm1KQzhWQUp1V1pBIiwgImFnZSIsIDIwXQ~WyJSVDh5My1Odmh6QXo4Q2ctS1NDRGh3IiwgImJpcmQiLCB7Il9zZCI6IFsiUVhINU9mSF8tMGtFYkEwWDBnd0RLenphc05ZYWRWekNWRGFrYlZfWnNxNCIsICJoUmtPNjRIVXZuaEFPbDBRS1NlZDFUWUhtb0VpRW9zb0R0WmsyRVl4ejdNIl19XQ~");
+
+        // Choose what to reveal
+        let revealed = json!(
+            {
+                "optional": "optional",
+                "foo": [false, true],
+                "bar": {
+                  "red": false,
+                  "green": true
+                },
+                "qux": [
+                  [false, true]
+                ],
+                "baz": [
+                  [false, true],
+                  [true, true]
+                ],
+                "animals": {
+                  "snake": {
+                    "name": false,
+                    "age": "optional"
+                  },
+                  "bird": {
+                    "name": false,
+                    "age": true
+                  }
+                }
+              }
+        );
+
+        let presentation =
+            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+                .unwrap()
+                .create_presentation::<SDJWTKey>(
+                    revealed.as_object().unwrap().clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await.unwrap();
+
+        let presentation: HashSet<_> = presentation
+            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR).map(String::from)
+            .collect();
+
+        let expected: HashSet<_> = expected_presentation
+            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .map(String::from).collect();
+
+        assert_eq!(presentation, expected);
+
+        Ok(())
+    }
+
+    #[async_test]
+    #[should_panic(
+        expected = "Requested claim 'unknown' doesn't exist"
+    )]
+    async fn create_presentation_with_unknown_claim_to_reveal_should_fail() -> std::io::Result<()> {
+        let sd_jwt = String::from("eyJhbGciOiJFUzI1NiJ9.eyJmb28iOlt7Ii4uLiI6Ii1XMWROTk0tNUI3WlpxR3R4MkF6RTA3X0hpRUpOZVJtNGtEQ1VORTVDNFUifSx7Ii4uLiI6ImpuUURqUEFoclY1bjMtRW5PVEZHWTcwMkd0T3FhN3hua3pVM0E4aElSX3cifV0sImJhciI6eyJfc2QiOlsiX25yZUxad2xVYlp1SmtqS1RVdHR5YkhqUTNrY2J4cnZab1dxUmVBbG4tcyIsImhGcjdBRElQbjZvQ3lSckNBN0VtNldLaGk1UjdXMWJjYWFZUFFrelpGMXciXX0sInF1eCI6W3siLi4uIjoieHl6MkRSSDRTSkpjdFFtMDEtSzROVVllMTMzMWh6U3VkTXd3MENDODEyUSJ9XSwiYmF6IjpbeyIuLi4iOiJRMGcyVmYzNnl6TnNvUkdNb0dsODZnZ2QyWGFVTmg5bGN6STFfbmFZYUhnIn0seyIuLi4iOiJZcGpMNTJKd1BfYmFFS21OaHFLazE3TWFrMl9fSWJCNmctY0haSHd6dmwwIn1dLCJhbmltYWxzIjp7Il9zZCI6WyJyQ19LNzlObG95SkFPWXRCOW9ITFlsTVJSS1V4UTNnaTZ0Wld0Zm90TWRjIiwidjUyd3d6bzB5Ymw2U2V1MjZWYklUODh5bHk1LXVMZkdlYTdkWnMxSHBwMCJdfSwiX3NkX2FsZyI6InNoYS0yNTYifQ.piidRp0pHJYmtExCJnLExaaWMTBX50mLwM6gFVYnD72DszyjpKbAoZhyAXT-I4CqqSpiHZg-2w8s26XBraqX6w~WyJCQ2k5UXlsWVVqVEpXWWVfbzRzOWxnIiwgIm9uZSJd~WyJSLXZ0bDBmbWF6N01zR1ZWRFh3T3BnIiwgInR3byJd~WyJXNWlOQ1Z1Qlo4OW9aV2dIUkxzRWJBIiwgInJlZCIsIDFd~WyJTQW5hNUJnaHJxUXJ0amR5SGxiejJBIiwgImdyZWVuIiwgMl0~WyJENVJrNVlIUkdJVXM5enp6OFUtOTVnIiwgImJsdWUiXQ~WyI0Y2tnSjJuWVhhV21jM3pVQ253d3N3IiwgInllbGxvdyJd~WyJ2Ml8tRG5JN0lEZ1loYVMzTG9Kb013IiwgW3siLi4uIjogIkhqMUQtZE1SNXR0YmpLcl9DUENETzRuVGlkTWR1YVNpMnlnYlhtcmR4MGcifSwgeyIuLi4iOiAiUl9Sb253SFY3bzR6Y0o3TV9jcTlobVpLZ2o2RkMtdmNXTko4bzNkeTg2MCJ9XV0~WyJwRHQtcEtfaklUYXhCVENJRFNvUnhBIiwgIm9yYW5nZSJd~WyJ1b3FDS0lpZGJzQmxhczhUaU5Kakh3IiwgInB1cnBsZSJd~WyJJWWFXMzVPNzBoUWg4OGlqWVBUVXZRIiwgW3siLi4uIjogIjlWdnFSbjk1ZUN6QnVkNkhYOG1faVRNMERZSVVxN0ZheFFtanowV1llbUkifSwgeyIuLi4iOiAiTmFOeXozWEJRZVc4Z1JRd28ySlN5NmhtbnJZT1JxRjMxeUhfWkhqbkRxNCJ9XV0~WyI4cFNkNHl0TWlPdnVGaFhQSXBPbW5BIiwgImJsYWNrIl0~WyJxLWR0QXhtZzY5cWZLMFpvS1BSbWFnIiwgIndoaXRlIl0~WyIzTzY0WmVYSjF6XzJWMXdrMGhJdUdBIiwgW3siLi4uIjogImRmVnVjbkwwMC1FVFh0RGpHaDlpRHYtSE5PZmRyZ1VuTlNYRk01VUlIRVkifSwgeyIuLi4iOiAiUlRnVmxQb25RTVZJNkEzNUJic21KTThDeDVTVTN1ZXJBMENyYmpvRW02USJ9XV0~WyJNQTlSbGMwUlAxNnVJWER6blRqOWJ3IiwgIm5hbWUiLCAicHl0aG9uIl0~WyJrblRLb0lKVzZuQ1VzeW1sN3lKWTNBIiwgImFnZSIsIDEwXQ~WyJlUEdwazZjdEhOSS1HS2JKbjZrR3lBIiwgInNuYWtlIiwgeyJfc2QiOiBbIjREU0s5REpJVEhROElITFFESld6SV9yM0lheXBIek5Ma19tc3BUa2xDVzQiLCAiYy11UFhEQkZJX2FDV1BUUHlYNFV0OWdDWW1DQ1FqUEw5TnRFZGotdWZtMCJdfV0~WyJOMzgyX2xTU1dpSzZsbGdPNFFhbUdnIiwgIm5hbWUiLCAiZWFnbGUiXQ~WyJjVWZVRVBrX0pDZm1KQzhWQUp1V1pBIiwgImFnZSIsIDIwXQ~WyJSVDh5My1Odmh6QXo4Q2ctS1NDRGh3IiwgImJpcmQiLCB7Il9zZCI6IFsiUVhINU9mSF8tMGtFYkEwWDBnd0RLenphc05ZYWRWekNWRGFrYlZfWnNxNCIsICJoUmtPNjRIVXZuaEFPbDBRS1NlZDFUWUhtb0VpRW9zb0R0WmsyRVl4ejdNIl19XQ~");
+
+        // Choose what to reveal
+        let revealed = json!(
+            {
+                "unknown": true,
+                "foo": [false, true],
+                "bar": {
+                  "red": false,
+                  "green": true
+                },
+                "qux": [
+                  [false, true]
+                ],
+                "baz": [
+                  [false, true],
+                  [true, true]
+                ],
+                "animals": {
+                  "snake": {
+                    "name": false,
+                    "age": true
+                  },
+                  "bird": {
+                    "name": false,
+                    "age": true
+                  }
+                }
+              }
+        );
+
+        SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                revealed.as_object().unwrap().clone(),
+                None,
+                None,
+                None,
+            )
+            .await.unwrap();
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn create_presentation_with_key_binding() -> std::io::Result<()> {
+        let mut user_claims = json!({
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "address": {
+                "street_address": "Schulstr. 12",
+                "locality": "Schulpforta",
+                "region": "Sachsen-Anhalt",
+                "country": "DE"
+            }
+        });
+
+        let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None
+        );
+
+        let private_holder_bytes = PRIVATE_HOLDER_PEM.as_bytes();
+        let holder_key = EncodingKey::from_ec_pem(private_holder_bytes).unwrap();
+        let holder_public_jwk = serde_json::from_value(PUBLIC_HOLDER_JWK.parse().unwrap()).unwrap();
+
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
+            user_claims.clone(),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            Some(holder_public_jwk),
+            false,
+            SDJWTSerializationFormat::Compact,
+            None,
+        ).await.unwrap();
+
+        user_claims["address"] = Value::Object(Map::new());
+        let presentation_with_kb =
+            SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
+                .unwrap()
+                .create_presentation(
+                    user_claims.as_object().unwrap().clone(),
+                    Some("1".to_string()),
+                    Some("https://example.com/aud".to_string()),
+                    Some(SDJWTKey::new(holder_key, None)),
+                )
+                .await.unwrap();
+
+        // TODO: Validate Key Binding part
+        let (presentation, _) = presentation_with_kb
+            .rsplit_once(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .unwrap();
+
+        let presentation = format!("{presentation}{COMBINED_SERIALIZATION_FORMAT_SEPARATOR}");
+
+        let mut parts: Vec<&str> = sd_jwt
+            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .collect();
+
+        parts.remove(6);
+        parts.remove(5);
+        parts.remove(4);
+        parts.remove(3);
+        let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
+        assert_eq!(expected, presentation);
+
+        Ok(())
+    }
 }

@@ -16,6 +16,7 @@ use sd_jwt_rs::{SDJWTHolder, SDJWTIssuer, SDJWTJson, SDJWTVerifier, SDJWTSeriali
 use sd_jwt_rs::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use sd_jwt_rs::key::{SDJWTKey, SDJWTPubKey};
 
 mod utils;
 
@@ -49,7 +50,7 @@ fn address_flat<'a>() -> (
     usize,
 ) {
     let value = _address_claims();
-    let number_of_revealed_sds = 2; // 2 == 1('sub') + 1('address')
+    let number_of_revealed_sds = 3; // 2 == 1('sub') + 1('address') + 1('iat')
     (
         value.clone(),
         ClaimsForSelectiveDisclosureStrategy::TopLevel,
@@ -70,12 +71,13 @@ fn address_full_recursive<'a>() -> (
 
     // revealed sds are:
     //    sub
+    //    iat
     //    address
     //    address.street_address
     //    address.locality
     //    address.region
     //    address.country
-    let number_of_revealed_sds = 6;
+    let number_of_revealed_sds = 7;
     (
         value,
         ClaimsForSelectiveDisclosureStrategy::AllLevels,
@@ -289,11 +291,11 @@ fn presentation_metadata() -> (
 #[case(nested_array())]
 #[case(complex_eidas())]
 #[case(w3c_vc())]
-fn demo_positive_cases(
+async fn demo_positive_cases(
     issuer_key: EncodingKey,
     #[case] data: (
         serde_json::Value,
-        ClaimsForSelectiveDisclosureStrategy,
+        ClaimsForSelectiveDisclosureStrategy<'_>,
         Map<String, Value>,
         usize,
     ),
@@ -310,26 +312,27 @@ fn demo_positive_cases(
     let (user_claims, strategy, holder_disclosed_claims, number_of_revealed_sds) = data;
     let (nonce, aud, holder_key, holder_jwk) = presentation_metadata;
     // Issuer issues SD-JWT
-    let sd_jwt = SDJWTIssuer::new(issuer_key, sign_algo.clone()).issue_sd_jwt(
+    let sd_jwt = SDJWTIssuer::new(SDJWTKey::new(issuer_key, sign_algo.clone())).issue_sd_jwt(
         user_claims.clone(),
         strategy,
         holder_jwk.clone(),
         add_decoy,
         format.clone(),
+        None,
     )
-        .unwrap();
+        .await.unwrap();
     let issued = sd_jwt.clone();
     // Holder creates presentation
     let mut holder = SDJWTHolder::new(sd_jwt.clone(), format.clone()).unwrap();
+    let signer = holder_key.map(|k| SDJWTKey::new(k, sign_algo));
     let presentation = holder
         .create_presentation(
             holder_disclosed_claims,
             nonce.clone(),
             aud.clone(),
-            holder_key,
-            sign_algo,
+            signer,
         )
-        .unwrap();
+        .await.unwrap();
 
     if format == SDJWTSerializationFormat::Compact {
         let mut issued_parts: HashSet<&str> = issued
@@ -372,16 +375,14 @@ fn demo_positive_cases(
         assert_eq!(revealed, issued);
     }
 
+    let public_issuer_bytes = ISSUER_PUBLIC_KEY.as_bytes();
+    let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+        .unwrap()
+        .into();
+
     // Verify presentation
-    let _verified = SDJWTVerifier::new(
-        presentation.clone(),
-        Box::new(|_, _| {
-            let public_issuer_bytes = ISSUER_PUBLIC_KEY.as_bytes();
-            DecodingKey::from_ec_pem(public_issuer_bytes).unwrap()
-        }),
-        aud,
-        nonce,
-        format,
-    )
+    let _verified = SDJWTVerifier::new(Box::new(issuer_pub_key))
+        .verify_presentation(presentation, aud, nonce, format)
+        .await
         .unwrap();
 }

@@ -1,11 +1,11 @@
 [package]
 name = "sd-jwt-rs"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 description = "Rust reference implementation of the IETF SD-JWT specification (v7)."
 rust-version = "1.67.0"
-authors = ["Abdulbois Tursunov <abdulbois.tursunov@dsr-corporation.com>, Sergey Minaev <sergey.minaev@dsr-corporation.com>"]
+authors = ["Sergey Minaev <sergey.minaev@dsr-corporation.com>"]
 repository = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 documentation = "https://docs.rs/sd-jwt-rs"
 homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
@@ -25,7 +25,10 @@ serde_json = { version = "1.0.113", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "1.0.51"
 strum = { version = "0.25", default-features = false, features = ["std", "derive"] }
+async-trait = "0.1.81"
 
 [dev-dependencies]
 rstest = "0.18.2"
 regex = "1.10"
+async-std = { version = "1.12.0", features = ["attributes"] }
+async-std-test = "0.0.4"

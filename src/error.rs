@@ -47,6 +47,9 @@ pub enum Error {
     #[error("key not found: {0}")]
     KeyNotFound(String),
 
+    #[error("signing error: {0}")]
+    SigningError(String),
+
     #[error("malformed delegation chain: {0}")]
     ChainParseError(String),
 

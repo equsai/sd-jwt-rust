@@ -20,6 +20,9 @@ mod disclosure;
 pub mod error;
 pub mod holder;
 pub mod issuer;
+pub mod key;
+pub mod resolver;
+pub mod signer;
 pub mod utils;
 pub mod verifier;
 
@@ -43,12 +46,6 @@ pub(crate) const JWK_KEY: &str = "jwk";
 /// Maximum chain depth the verifier accepts (number of KB-SD-JWT links between the
 /// issuer-signed JWT and the final KB-JWT). Protects against runaway recursion / DoS.
 pub const MAX_DELEGATION_DEPTH: usize = 32;
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct SDJWTHasSDClaimException(String);
-
-impl SDJWTHasSDClaimException {}
 
 /// SDJWTSerializationFormat is used to determine how an SD-JWT is serialized to String
 #[derive(Default, Clone, PartialEq, Debug, Display)]
@@ -262,6 +259,28 @@ impl SDJWTCommon {
             .and_then(Value::as_str)
             .map(String::from);
         sign_alg
+    }
+
+    /// Unpack all disclosed claims of an issuer-signed SD-JWT payload. Used by
+    /// [`crate::utils::decode_sd_jwt`] and shares the disclosure-unpacking logic
+    /// with the verifier (see [`crate::verifier::unpack_disclosed_claims`]).
+    pub(crate) fn extract_sd_claims(&mut self, sd_jwt_payload: &Map<String, Value>) -> Result<Value> {
+        if sd_jwt_payload.contains_key(DIGEST_ALG_KEY)
+            && sd_jwt_payload[DIGEST_ALG_KEY] != DEFAULT_DIGEST_ALG
+        {
+            return Err(Error::DeserializationError(format!(
+                "Invalid hash algorithm {}",
+                sd_jwt_payload[DIGEST_ALG_KEY]
+            )));
+        }
+
+        let claims: Value = sd_jwt_payload.clone().into_iter().collect();
+        let mut seen = Vec::new();
+        crate::verifier::unpack_disclosed_claims(
+            &claims,
+            &self.hash_to_decoded_disclosure,
+            &mut seen,
+        )
     }
 }
 

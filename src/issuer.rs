@@ -9,28 +9,30 @@ use std::str::FromStr;
 use std::vec::Vec;
 
 use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, Header};
 use rand::Rng;
 use serde_json::Value;
 use serde_json::{json, Map as SJMap, Map};
 
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
-use crate::utils::{base64_hash, generate_salt};
+use crate::utils::{base64_hash, encode, generate_salt};
 use crate::{
     SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
-    DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, SD_DIGESTS_KEY, SD_LIST_PREFIX,
+    DIGEST_ALG_KEY, JWK_KEY, SD_DIGESTS_KEY, SD_LIST_PREFIX,
     SDJWTSerializationFormat,
 };
+use crate::signer::SDJWTSigner;
 
-pub struct SDJWTIssuer {
+const ALWAYS_REVEALED_ROOT_KEYS: [&str; 4] = ["iss", "exp", "nbf", "aud"];
+
+pub struct SDJWTIssuer<S: SDJWTSigner> {
     // parameters
-    sign_alg: String,
     add_decoy_claims: bool,
     extra_header_parameters: Option<HashMap<String, String>>,
 
     // input data
-    issuer_key: EncodingKey,
+    signer: S,
     holder_key: Option<Jwk>,
 
     // internal fields
@@ -88,11 +90,11 @@ impl<'a> ClaimsForSelectiveDisclosureStrategy<'a> {
                     .iter()
                     .filter_map(|str| {
                         str.strip_prefix(key).and_then(|str|
-                            match str.chars().next() {
-                                Some('.') => Some(&str[1..]), // next token
-                                Some('[') => Some(str),       // array index
-                                _ => None,
-                            }
+                        match str.chars().next() {
+                            Some('.') => Some(&str[1..]), // next token
+                            Some('[') => Some(str),       // array index
+                            _ => None,
+                        }
                         )
                     })
                     .collect();
@@ -111,7 +113,7 @@ impl<'a> ClaimsForSelectiveDisclosureStrategy<'a> {
     }
 }
 
-impl SDJWTIssuer {
+impl <S: SDJWTSigner> SDJWTIssuer<S> {
     const DECOY_MIN_ELEMENTS: u32 = 2;
     const DECOY_MAX_ELEMENTS: u32 = 5;
 
@@ -120,17 +122,16 @@ impl SDJWTIssuer {
     /// The instance can be used mutliple times to issue SD-JWTs.
     ///
     /// # Arguments
-    /// * `issuer_key` - The key used to sign the SD-JWT.
-    /// * `sign_alg` - The signing algorithm used to sign the SD-JWT. If not provided, the default algorithm is used.
+    /// * `signer` - The signer used to sign the SD-JWT
+    /// * `extra_header_parameters` - Additional SD-JWT header parameters
     ///
     /// # Returns
     /// A new SDJWTIssuer instance.
-    pub fn new(issuer_key: EncodingKey, sign_alg: Option<String>) -> Self {
+    pub fn new(signer: S) -> Self {
         SDJWTIssuer {
-            sign_alg: sign_alg.unwrap_or(DEFAULT_SIGNING_ALG.to_owned()),
             add_decoy_claims: false,
             extra_header_parameters: None,
-            issuer_key,
+            signer,
             holder_key: None,
             inner: Default::default(),
             all_disclosures: vec![],
@@ -159,14 +160,14 @@ impl SDJWTIssuer {
     ///
     /// # Returns
     /// The issued SD-JWT as a string in the requested serialization format.
-    pub fn issue_sd_jwt(
+    pub async fn issue_sd_jwt(
         &mut self,
         user_claims: Value,
-        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
         holder_key: Option<Jwk>,
         add_decoy_claims: bool,
         serialization_format: SDJWTSerializationFormat,
-        // extra_header_parameters: Option<HashMap<String, String>>,
+        extra_header_parameters: Option<HashMap<String, String>>,
     ) -> Result<String> {
         let inner = SDJWTCommon {
             serialization_format,
@@ -181,9 +182,10 @@ impl SDJWTIssuer {
         self.inner = inner;
         self.holder_key = holder_key;
         self.add_decoy_claims = add_decoy_claims;
+        self.extra_header_parameters = extra_header_parameters;
 
         self.assemble_sd_jwt_payload(user_claims, sd_strategy)?;
-        self.create_signed_jws()?;
+        self.create_signed_jws().await?;
         self.create_combined()?;
 
         Ok(self.serialized_sd_jwt.clone())
@@ -197,8 +199,7 @@ impl SDJWTIssuer {
         let claims_obj_ref = user_claims
             .as_object_mut()
             .ok_or(Error::ConversionError("json object".to_string()))?;
-        let always_revealed_root_keys = vec!["iss", "iat", "exp"];
-        let mut always_revealed_claims: Map<String, Value> = always_revealed_root_keys
+        let mut always_revealed_claims: Map<String, Value> = ALWAYS_REVEALED_ROOT_KEYS
             .into_iter()
             .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
             .collect();
@@ -296,66 +297,80 @@ impl SDJWTIssuer {
         Value::Object(claims)
     }
 
-    fn create_signed_jws(&mut self) -> Result<()> {
-        if let Some(extra_headers) = &self.extra_header_parameters {
-            let mut _protected_headers = extra_headers.clone();
-            for (key, value) in extra_headers.iter() {
-                _protected_headers.insert(key.to_string(), value.to_string());
-            }
-            unimplemented!("extra_headers are not supported for issuance");
-        }
-
+    async fn create_signed_jws(&mut self) -> Result<()> {
         let mut header = Header::new(
-            Algorithm::from_str(&self.sign_alg)
+            Algorithm::from_str(&self.signer.algorithm())
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
         );
+
         header.typ = self.inner.typ.clone();
-        self.signed_sd_jwt = jsonwebtoken::encode(&header, &self.sd_jwt_payload, &self.issuer_key)
-            .map_err(|e| Error::DeserializationError(e.to_string()))?;
+
+        if let Some(extra_headers) = &self.extra_header_parameters {
+            for (key, value) in extra_headers.iter() {
+                match key.as_str() {
+                    "typ" => if header.typ.is_none() { header.typ = Some(value.clone()); },
+                    "cty" => header.cty = Some(value.clone()),
+                    "jku" => header.jku = Some(value.clone()),
+                    "jwk" => header.jwk = serde_json::from_str(value)
+                        .map_err(|e| Error::DeserializationError(e.to_string()))?,
+                    "kid" => header.kid = Some(value.clone()),
+                    "x5u" => header.x5u = Some(value.clone()),
+                    "x5c" => header.x5c = serde_json::from_str(value)
+                        .map_err(|e| Error::DeserializationError(e.to_string()))?,
+                    "x5t" => header.x5t = Some(value.clone()),
+                    "x5t#S256" => header.x5t_s256 = Some(value.clone()),
+                    "alg" => return Err(Error::InvalidInput("The 'alg' header cannot be overwritten".to_string())),
+                    _ => return Err(Error::InvalidInput(format!("Unsupported header: {}", key))),
+                }
+            }
+        }
+
+        self.signed_sd_jwt = encode(&header, &self.sd_jwt_payload, &self.signer).await?;
 
         Ok(())
     }
 
     fn create_combined(&mut self) -> Result<()> {
-        match self.inner.serialization_format  {
-            SDJWTSerializationFormat::Compact => {
-                let mut disclosures: VecDeque<String> = self
+        if self.inner.serialization_format == SDJWTSerializationFormat::Compact {
+            let mut disclosures: VecDeque<String> = self
+                .all_disclosures
+                .iter()
+                .map(|d| d.raw_b64.to_string())
+                .collect();
+            disclosures.push_front(self.signed_sd_jwt.clone());
+
+            let disclosures: Vec<&str> = disclosures.iter().map(|s| s.as_str()).collect();
+
+            self.serialized_sd_jwt = format!(
+                "{}{}",
+                disclosures.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR),
+                COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+            );
+        } else if self.inner.serialization_format == SDJWTSerializationFormat::JSON {
+            let jwt: Vec<&str> = self.signed_sd_jwt.split('.').collect();
+            if jwt.len() != 3 {
+                return Err(Error::InvalidInput(format!(
+                    "Invalid JWT, JWT must contain three parts after splitting with \".\": jwt {}",
+                    self.signed_sd_jwt
+                )));
+            }
+            let sd_jwt_json = SDJWTJson {
+                protected: jwt[0].to_owned(),
+                payload: jwt[1].to_owned(),
+                signature: jwt[2].to_owned(),
+                kb_jwt: None,
+                disclosures: self
                     .all_disclosures
                     .iter()
                     .map(|d| d.raw_b64.to_string())
-                    .collect();
-                disclosures.push_front(self.signed_sd_jwt.clone());
-
-                let disclosures: Vec<&str> = disclosures.iter().map(|s| s.as_str()).collect();
-
-                self.serialized_sd_jwt = format!(
-                    "{}{}",
-                    disclosures.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR),
-                    COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
-                );
-            },
-            SDJWTSerializationFormat::JSON => {
-                let jwt: Vec<&str> = self.signed_sd_jwt.split('.').collect();
-                if jwt.len() != 3 {
-                    return Err(Error::InvalidInput(format!(
-                        "Invalid JWT, JWT must contain three parts after splitting with \".\": jwt {}",
-                        self.signed_sd_jwt
-                    )));
-                }
-                let sd_jwt_json = SDJWTJson {
-                    protected: jwt[0].to_owned(),
-                    payload: jwt[1].to_owned(),
-                    signature: jwt[2].to_owned(),
-                    kb_jwt: None,
-                    disclosures: self
-                        .all_disclosures
-                        .iter()
-                        .map(|d| d.raw_b64.to_string())
-                        .collect(),
-                };
-                self.serialized_sd_jwt = serde_json::to_string(&sd_jwt_json)
-                    .map_err(|e| Error::DeserializationError(e.to_string()))?;
-            }
+                    .collect(),
+            };
+            self.serialized_sd_jwt = serde_json::to_string(&sd_jwt_json)
+                .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        } else {
+            return Err(Error::InvalidInput(
+                format!("Unknown serialization format {}, only \"Compact\" or \"JSON\" formats are supported", self.inner.serialization_format)
+            ));
         }
 
         Ok(())
@@ -369,17 +384,18 @@ impl SDJWTIssuer {
 
 #[cfg(test)]
 mod tests {
+    use async_std_test::async_test;
     use jsonwebtoken::EncodingKey;
-    use log::trace;
     use serde_json::json;
 
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
     use crate::{SDJWTIssuer, SDJWTSerializationFormat};
+    use crate::key::SDJWTKey;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 
-    #[test]
-    fn test_assembly_sd_full_recursive() {
+    #[async_test]
+    async fn test_assembly_sd_full_recursive() -> std::io::Result<()> {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -393,16 +409,25 @@ mod tests {
             }
         });
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
-        let issuer_key = EncodingKey::from_ec_pem(private_issuer_bytes).unwrap();
-        let sd_jwt = SDJWTIssuer::new(issuer_key, None).issue_sd_jwt(
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
+            None,
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
             user_claims,
             ClaimsForSelectiveDisclosureStrategy::AllLevels,
             None,
             false,
             SDJWTSerializationFormat::Compact,
+            Some([
+                ("typ".to_string(), "vc+sd-jwt".to_string()),
+                ("kid".to_string(), "GNWaAL2PVUU2JIT89m6q0c7Svc40S-bvR1SOD7DFBoU".to_string()),
+            ].iter().cloned().collect()),
         )
-            .unwrap();
-        trace!("{:?}", sd_jwt)
+            .await.unwrap();
+        println!("{:?}", sd_jwt);
+
+        Ok(())
     }
 
     #[test]
@@ -434,7 +459,7 @@ mod tests {
             "street_address",
             "locality",
             "region",
-            "country"
+            "country",
         ]));
     }
 }
