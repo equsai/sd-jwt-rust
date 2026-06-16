@@ -652,7 +652,7 @@ fn enforce_delegate_payload_rule(
 /// `hash_to_decoded`. `seen` accumulates the digests resolved during this pass so
 /// a digest used twice is rejected as a duplicate. Digests with no matching
 /// disclosure are treated as decoys and skipped.
-fn unpack_disclosed_claims(
+pub fn unpack_disclosed_claims(
     sd_jwt_claims: &Value,
     hash_to_decoded: &HashMap<String, Value>,
     seen: &mut Vec<String>,
