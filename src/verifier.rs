@@ -111,29 +111,41 @@ impl SDJWTVerifier {
 
         if let (Some(expected_aud), Some(expected_nonce)) = (&expected_aud, &expected_nonce) {
             if let Some(chain) = self.sd_jwt_engine.delegation_chain.clone() {
-                // dSD-JWT+KB: the trailing KB-JWT binds to the final link and is
-                // signed by the final Delegate Holder's key.
-                let kb_jwt = chain.trailing_kb_jwt.as_ref().ok_or_else(|| {
-                    Error::InvalidInput(
-                        "expected_aud/expected_nonce were provided but this dSD-JWT has no final KB-JWT"
-                            .to_string(),
-                    )
-                })?;
-                let last_jwk = self.chain_cnfs.last().ok_or_else(|| {
-                    Error::InvalidDelegatePayload(
-                        "trailing KB-JWT present but chain produced no cnf for final binding".into(),
-                    )
-                })?;
-                let expected_sd_hash = chain.final_kb_sd_hash().ok_or_else(|| {
-                    Error::InvalidState("delegation chain present but has no links".into())
-                })?;
-                verify_final_kb_jwt(
-                    kb_jwt,
-                    last_jwk,
-                    expected_aud,
-                    expected_nonce,
-                    &expected_sd_hash,
-                )?;
+                if let Some(kb_jwt) = chain.trailing_kb_jwt.as_ref() {
+                    // dSD-JWT+KB: the trailing KB-JWT binds to the final link and is
+                    // signed by the final Delegate Holder's key.
+                    let last_jwk = self.chain_cnfs.last().ok_or_else(|| {
+                        Error::InvalidDelegatePayload(
+                            "trailing KB-JWT present but chain produced no cnf for final binding"
+                                .into(),
+                        )
+                    })?;
+                    let expected_sd_hash = chain.final_kb_sd_hash().ok_or_else(|| {
+                        Error::InvalidState("delegation chain present but has no links".into())
+                    })?;
+                    verify_final_kb_jwt(
+                        kb_jwt,
+                        last_jwk,
+                        expected_aud,
+                        expected_nonce,
+                        &expected_sd_hash,
+                    )?;
+                } else {
+                    // Plain dSD-JWT (no trailing KB-JWT): the credential was delegated
+                    // to this Verifier, so the final KB-SD-JWT link IS the key binding.
+                    // Per the Delegate SD-JWT spec, the claims a KB-JWT would carry
+                    // (`aud`, `nonce`) live in that link's Delegate Payload instead. The
+                    // chain walk already signature-verified the link and captured its
+                    // disclosed Delegate Payload, so validate `aud`/`nonce` there.
+                    let final_payload = self.verified_delegate_payloads.last().ok_or_else(|| {
+                        Error::InvalidDelegatePayload(
+                            "expected_aud/expected_nonce were provided but the delegation chain \
+                             produced no Delegate Payload to bind them"
+                                .into(),
+                        )
+                    })?;
+                    verify_delegate_payload_binding(final_payload, expected_aud, expected_nonce)?;
+                }
             } else {
                 let sign_alg = self.sd_jwt_engine.unverified_input_key_binding_jwt
                     .as_ref()
@@ -205,12 +217,6 @@ impl SDJWTVerifier {
         let mut parent_disclosures = chain.issuer_disclosures.clone();
         let trailing_kb_jwt_present = chain.trailing_kb_jwt.is_some();
 
-        // The effective validity window of a dSD-JWT is the intersection of every
-        // component's `exp`/`nbf`: any party in the chain may narrow it, none may
-        // widen it. Snapshot `now` once so every component is checked against the
-        // same instant. The issuer-signed JWT's `exp` is also enforced by
-        // `jsonwebtoken` during `verify_sd_jwt`; re-checking here additionally
-        // covers its `nbf` and keeps the whole-chain check consistent.
         let now = now_secs()?;
         if let Some(issuer_claims) = self.verified_claims.as_object() {
             validate_lifetime(issuer_claims, "issuer-signed JWT", now)?;
@@ -581,6 +587,37 @@ fn verify_final_kb_jwt(
     }
     if decoded.claims.get(KB_DIGEST_KEY) != Some(&Value::String(expected_sd_hash.to_string())) {
         return Err(Error::InvalidInput("Invalid digest in KB-JWT".to_string()));
+    }
+    Ok(())
+}
+
+/// Validate `aud`/`nonce` against a plain dSD-JWT's final Delegate Payload.
+///
+/// When a dSD-JWT is presented with no trailing KB-JWT, the final KB-SD-JWT link
+/// is itself the key binding to this Verifier; per the Delegate SD-JWT spec the
+/// claims a KB-JWT would carry (`aud`, `nonce`) live in that link's Delegate
+/// Payload. The payload's signature was already verified during the chain walk, so
+/// here we only confirm the bound audience and nonce match what the Verifier
+/// expects. `aud` may be a single string or an array containing the expected value.
+fn verify_delegate_payload_binding(
+    delegate_payload: &Map<String, Value>,
+    expected_aud: &str,
+    expected_nonce: &str,
+) -> Result<()> {
+    let aud_ok = match delegate_payload.get("aud") {
+        Some(Value::String(aud)) => aud == expected_aud,
+        Some(Value::Array(auds)) => auds.iter().any(|v| v.as_str() == Some(expected_aud)),
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(Error::InvalidInput(
+            "Invalid or missing aud in final Delegate Payload".to_string(),
+        ));
+    }
+    if delegate_payload.get("nonce") != Some(&Value::String(expected_nonce.to_string())) {
+        return Err(Error::InvalidInput(
+            "Invalid or missing nonce in final Delegate Payload".to_string(),
+        ));
     }
     Ok(())
 }

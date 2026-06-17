@@ -887,3 +887,128 @@ async fn valid_delegate_payload_lifetime_round_trips() -> std::io::Result<()> {
     );
     Ok(())
 }
+
+/// Build a dSD-JWT delegated to a Verifier, with `aud`/`nonce` bound inside the
+/// final KB-SD-JWT link's Delegate Payload (and no trailing KB-JWT). `with_cnf`
+/// selects a `kb+sd-jwt+kb` link (carries a cnf) vs a terminal `kb+sd-jwt`.
+async fn delegate_to_verifier(aud: &str, nonce: &str, with_cnf: bool) -> String {
+    let user_claims = json!({
+        "iss": "https://example.com/issuer",
+        "iat": 1683000000,
+        "exp": 1883000000,
+        "sub": "nina"
+    });
+    let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
+    let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk).await;
+
+    let mut payload = json!({ "scope": "x", "aud": aud, "nonce": nonce });
+    if with_cnf {
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("cnf".to_string(), cnf_claim(DELEGATE2_JWK));
+    }
+
+    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let dsd_jwt = holder
+        .delegate(
+            vec![payload],
+            Some(Map::new()),
+            None,
+            holder_signer(),
+            ChainBindingMode::SdHash,
+        )
+        .await
+        .unwrap();
+
+    // Present as-is (no trailing KB-JWT): the credential is delegated to the Verifier.
+    let mut delegate = SDJWTHolder::new(dsd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    delegate
+        .create_presentation::<SDJWTKey>(Map::new(), None, None, None)
+        .await
+        .unwrap()
+}
+
+#[async_test]
+async fn aud_nonce_in_final_kb_sd_jwt_payload_round_trips() -> std::io::Result<()> {
+    let aud = "verifier.example".to_string();
+    let nonce = "nonce-xyz".to_string();
+    // Terminal kb+sd-jwt: the chain has no trailing KB-JWT, so the Verifier must
+    // read aud/nonce from the final Delegate Payload.
+    let presentation = delegate_to_verifier(&aud, &nonce, false).await;
+
+    let mut verifier = SDJWTVerifier::new(issuer_key_resolver());
+    let verified_claims = verifier
+        .verify_presentation(
+            presentation,
+            Some(aud.clone()),
+            Some(nonce.clone()),
+            SDJWTSerializationFormat::Compact,
+        )
+        .await
+        .expect("aud/nonce bound in the final KB-SD-JWT Delegate Payload must verify");
+
+    assert_eq!(verifier.verified_delegate_payloads.len(), 1);
+    assert_eq!(
+        verified_claims.as_object().unwrap().get("scope"),
+        Some(&Value::String("x".into()))
+    );
+    Ok(())
+}
+
+#[async_test]
+async fn aud_nonce_in_final_kb_sd_jwt_kb_payload_round_trips() -> std::io::Result<()> {
+    // Same, but the final link is kb+sd-jwt+kb (carries a cnf). Still presented
+    // without a trailing KB-JWT, so aud/nonce come from the Delegate Payload.
+    let aud = "verifier.example".to_string();
+    let nonce = "nonce-xyz".to_string();
+    let presentation = delegate_to_verifier(&aud, &nonce, true).await;
+
+    let mut verifier = SDJWTVerifier::new(issuer_key_resolver());
+    verifier
+        .verify_presentation(
+            presentation,
+            Some(aud),
+            Some(nonce),
+            SDJWTSerializationFormat::Compact,
+        )
+        .await
+        .expect("aud/nonce in a kb+sd-jwt+kb Delegate Payload must verify without a trailing KB-JWT");
+    Ok(())
+}
+
+#[async_test]
+async fn wrong_aud_in_final_kb_sd_jwt_payload_is_rejected() -> std::io::Result<()> {
+    let presentation = delegate_to_verifier("verifier.example", "nonce-xyz", false).await;
+    let result = SDJWTVerifier::new(issuer_key_resolver())
+        .verify_presentation(
+            presentation,
+            Some("attacker.example".into()), // wrong audience
+            Some("nonce-xyz".into()),
+            SDJWTSerializationFormat::Compact,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "verifier must reject a dSD-JWT whose Delegate Payload binds a different aud"
+    );
+    Ok(())
+}
+
+#[async_test]
+async fn wrong_nonce_in_final_kb_sd_jwt_payload_is_rejected() -> std::io::Result<()> {
+    let presentation = delegate_to_verifier("verifier.example", "nonce-xyz", false).await;
+    let result = SDJWTVerifier::new(issuer_key_resolver())
+        .verify_presentation(
+            presentation,
+            Some("verifier.example".into()),
+            Some("stale-nonce".into()), // wrong nonce
+            SDJWTSerializationFormat::Compact,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "verifier must reject a dSD-JWT whose Delegate Payload binds a different nonce"
+    );
+    Ok(())
+}
