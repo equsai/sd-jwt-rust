@@ -26,6 +26,7 @@ sha2 = "0.10"
 thiserror = "1.0.51"
 strum = { version = "0.25", default-features = false, features = ["std", "derive"] }
 async-trait = "0.1.81"
+time = { version = "0.3.37", features = ["serde", "wasm-bindgen"] }
 
 [dev-dependencies]
 rstest = "0.18.2"

@@ -9,7 +9,6 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::ops::Add;
 use std::str::FromStr;
-use std::time;
 
 use crate::delegate::{
     compute_issuer_jwt_hash, compute_sd_hash, link_binding_mode, link_delegate_payload_stubs,
@@ -191,28 +190,26 @@ impl SDJWTHolder {
         aud: String,
         signer: S,
     ) -> Result<()> {
-        let alg = signer.algorithm().to_string();
+        let alg = signer.algorithm();
         // Set key-binding fields
         self.key_binding_jwt_header
-            .insert("alg".to_string(), alg.clone().into());
+            .insert("alg".to_string(), alg.into());
         self.key_binding_jwt_header
             .insert("typ".to_string(), crate::KB_JWT_TYP_HEADER.into());
         self.key_binding_jwt_payload
             .insert("nonce".to_string(), nonce.into());
         self.key_binding_jwt_payload
             .insert("aud".to_string(), aud.into());
-        let timestamp = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .map_err(|e| Error::ConversionError(format!("timestamp: {}", e)))?
-            .as_secs();
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
         self.key_binding_jwt_payload
             .insert("iat".to_string(), timestamp.into());
         self.set_key_binding_digest_key()?;
         // Create key-binding jwt
         let mut header = Header::new(
-            Algorithm::from_str(&alg)
+            Algorithm::from_str(alg)
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
         );
+
         header.typ = Some(crate::KB_JWT_TYP_HEADER.into());
         self.serialized_key_binding_jwt =
             encode(&header, &self.key_binding_jwt_payload, &signer).await?;
@@ -771,10 +768,7 @@ async fn build_kb_jwt<S: SDJWTSigner>(
     let mut payload: Map<String, Value> = Map::new();
     payload.insert("nonce".to_string(), Value::String(nonce));
     payload.insert("aud".to_string(), Value::String(aud));
-    let timestamp = time::SystemTime::now()
-        .duration_since(time::UNIX_EPOCH)
-        .map_err(|e| Error::ConversionError(format!("timestamp: {}", e)))?
-        .as_secs();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
     payload.insert("iat".to_string(), timestamp.into());
     payload.insert(KB_DIGEST_KEY.to_string(), Value::String(sd_hash));
 
