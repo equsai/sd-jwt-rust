@@ -10,31 +10,42 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use strum::Display;
 use std::collections::HashMap;
-use log::debug;
-pub use {holder::SDJWTHolder, issuer::SDJWTIssuer, issuer::ClaimsForSelectiveDisclosureStrategy, verifier::SDJWTVerifier};
+pub use {
+    delegate::ChainBindingMode, holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy,
+    issuer::SDJWTIssuer, verifier::SDJWTVerifier,
+};
 
+pub(crate) mod delegate;
 mod disclosure;
 pub mod error;
 pub mod holder;
 pub mod issuer;
-pub mod utils;
-pub mod verifier;
-pub mod signer;
 pub mod key;
 pub mod resolver;
+pub mod signer;
+pub mod utils;
+pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
-const SD_DIGESTS_KEY: &str = "_sd";
-const DIGEST_ALG_KEY: &str = "_sd_alg";
+pub(crate) const SD_DIGESTS_KEY: &str = "_sd";
+pub(crate) const DIGEST_ALG_KEY: &str = "_sd_alg";
 pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
-const SD_LIST_PREFIX: &str = "...";
+pub(crate) const SD_LIST_PREFIX: &str = "...";
 const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
-const KB_JWT_TYP_HEADER: &str = "kb+jwt";
-const KB_DIGEST_KEY: &str = "sd_hash";
+pub(crate) const KB_JWT_TYP_HEADER: &str = "kb+jwt";
+pub(crate) const KB_SD_JWT_TYP_HEADER: &str = "kb+sd-jwt";
+pub(crate) const KB_SD_JWT_KB_TYP_HEADER: &str = "kb+sd-jwt+kb";
+pub(crate) const KB_DIGEST_KEY: &str = "sd_hash";
+pub(crate) const ISSUER_JWT_HASH_KEY: &str = "issuer_jwt_hash";
+pub(crate) const DELEGATE_PAYLOAD_KEY: &str = "delegate_payload";
 pub const COMBINED_SERIALIZATION_FORMAT_SEPARATOR: &str = "~";
-const JWT_SEPARATOR: &str = ".";
-const CNF_KEY: &str = "cnf";
-const JWK_KEY: &str = "jwk";
+pub(crate) const JWT_SEPARATOR: &str = ".";
+pub(crate) const CNF_KEY: &str = "cnf";
+pub(crate) const JWK_KEY: &str = "jwk";
+
+/// Maximum chain depth the verifier accepts (number of KB-SD-JWT links between the
+/// issuer-signed JWT and the final KB-JWT). Protects against runaway recursion / DoS.
+pub const MAX_DELEGATION_DEPTH: usize = 32;
 
 /// SDJWTSerializationFormat is used to determine how an SD-JWT is serialized to String
 #[derive(Default, Clone, PartialEq, Debug, Display)]
@@ -46,7 +57,7 @@ pub enum SDJWTSerializationFormat {
     Compact,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub(crate) struct SDJWTCommon {
     typ: Option<String>,
     serialization_format: SDJWTSerializationFormat,
@@ -58,7 +69,7 @@ pub(crate) struct SDJWTCommon {
     hash_to_disclosure: HashMap<String, String>,
     input_disclosures: Vec<String>,
     sign_alg: Option<String>,
-    duplicate_hash_check: Vec<String>,
+    pub(crate) delegation_chain: Option<delegate::DelegationChain>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
@@ -130,6 +141,30 @@ impl SDJWTCommon {
     }
 
     fn parse_compact_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
+        // Detect delegation chain first; if present, populate `delegation_chain` and the
+        // legacy fields that downstream code reads (issuer JWT + its forwarded disclosures
+        // + optional final KB-JWT). Otherwise fall through to the legacy parser.
+        if let Some(chain) = delegate::DelegationChain::try_parse_compact(&sd_jwt_with_disclosures)?
+        {
+            self.sign_alg = Self::decode_header_and_get_sign_algorithm(&chain.issuer_jwt);
+            self.unverified_input_key_binding_jwt = chain.trailing_kb_jwt.clone();
+            // hash_to_disclosure must resolve digests from EVERY segment of the chain.
+            self.input_disclosures = chain.all_disclosures();
+            self.unverified_sd_jwt = Some(chain.issuer_jwt.clone());
+
+            let mut sd_jwt = chain.issuer_jwt.split(JWT_SEPARATOR);
+            sd_jwt.next();
+            let jwt_body = sd_jwt.next().ok_or(Error::IndexOutOfBounds {
+                idx: 1,
+                length: 3,
+                msg: format!("Invalid issuer JWT in chain: {}", chain.issuer_jwt),
+            })?;
+            self.unverified_input_sd_jwt_payload = Some(jwt_payload_decode(jwt_body)?);
+            self.delegation_chain = Some(chain);
+            return Ok(());
+        }
+
+        // Plain SD-JWT(+KB).
         let parts: Vec<&str> = sd_jwt_with_disclosures
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
@@ -146,7 +181,7 @@ impl SDJWTCommon {
             length: parts.len(),
             msg: format!("Invalid SD-JWT: {}", sd_jwt_with_disclosures),
         })?;
-        self.sign_alg = Self::decode_header_and_get_sign_algorithm(&sd_jwt);
+        self.sign_alg = Self::decode_header_and_get_sign_algorithm(sd_jwt);
         self.unverified_input_key_binding_jwt = Some(
             parts
                 .next_back()
@@ -226,7 +261,10 @@ impl SDJWTCommon {
         sign_alg
     }
 
-    fn extract_sd_claims(&mut self, sd_jwt_payload: &Map<String, Value>) -> Result<Value> {
+    /// Unpack all disclosed claims of an issuer-signed SD-JWT payload. Used by
+    /// [`crate::utils::decode_sd_jwt`] and shares the disclosure-unpacking logic
+    /// with the verifier (see [`crate::verifier::unpack_disclosed_claims`]).
+    pub(crate) fn extract_sd_claims(&mut self, sd_jwt_payload: &Map<String, Value>) -> Result<Value> {
         if sd_jwt_payload.contains_key(DIGEST_ALG_KEY)
             && sd_jwt_payload[DIGEST_ALG_KEY] != DEFAULT_DIGEST_ALG
         {
@@ -236,147 +274,13 @@ impl SDJWTCommon {
             )));
         }
 
-        self.duplicate_hash_check = Vec::new();
         let claims: Value = sd_jwt_payload.clone().into_iter().collect();
-        self.unpack_disclosed_claims(&claims)
-    }
-
-    fn unpack_disclosed_claims(&mut self, sd_jwt_claims: &Value) -> Result<Value> {
-        match sd_jwt_claims {
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                Ok(sd_jwt_claims.to_owned())
-            }
-            Value::Array(arr) => {
-                self.unpack_disclosed_claims_in_array(arr)
-            }
-            Value::Object(obj) => {
-                self.unpack_disclosed_claims_in_object(obj)
-            }
-        }
-    }
-
-    fn unpack_disclosed_claims_in_array(&mut self, arr: &Vec<Value>) -> Result<Value> {
-        if arr.is_empty() {
-            return Err(Error::InvalidArrayDisclosureObject(
-                "Array of disclosed claims cannot be empty".to_string(),
-            ));
-        }
-
-        let mut claims = vec![];
-        for value in arr {
-
-            match value {
-                // case for SD objects in arrays
-                Value::Object(obj) if obj.contains_key(SD_LIST_PREFIX) => {
-                    if obj.len() > 1 {
-                        return Err(Error::InvalidDisclosure(
-                            "Disclosed claim object in an array maust contain only one key".to_string(),
-                        ));
-                    }
-
-                    let digest = obj.get(SD_LIST_PREFIX).unwrap();
-                    let disclosed_claim = self.unpack_from_digest(digest)?;
-                    if let Some(disclosed_claim) = disclosed_claim {
-                        claims.push(disclosed_claim);
-                    }
-                },
-                _ => {
-                    let claim = self.unpack_disclosed_claims(value)?;
-                    claims.push(claim);
-                },
-            }
-        }
-        Ok(Value::Array(claims))
-    }
-
-    fn unpack_disclosed_claims_in_object(&mut self, nested_sd_jwt_claims: &Map<String, Value>) -> Result<Value> {
-        let mut disclosed_claims: Map<String, Value> = serde_json::Map::new();
-
-        for (key, value) in nested_sd_jwt_claims {
-            if key != SD_DIGESTS_KEY && key != DIGEST_ALG_KEY {
-                disclosed_claims.insert(key.to_owned(), self.unpack_disclosed_claims(value)?);
-            }
-        }
-
-        if let Some(Value::Array(digest_of_disclosures)) = nested_sd_jwt_claims.get(SD_DIGESTS_KEY)
-        {
-            self.unpack_from_digests(&mut disclosed_claims, digest_of_disclosures)?;
-        }
-
-        Ok(Value::Object(disclosed_claims))
-    }
-
-    fn unpack_from_digests(
-        &mut self,
-        pre_output: &mut Map<String, Value>,
-        digests_of_disclosures: &Vec<Value>,
-    ) -> Result<()> {
-        for digest in digests_of_disclosures {
-            let digest = digest
-                .as_str()
-                .ok_or(Error::ConversionError("str".to_string()))?;
-            if self.duplicate_hash_check.contains(&digest.to_string()) {
-                return Err(Error::DuplicateDigestError(digest.to_string()));
-            }
-            self.duplicate_hash_check.push(digest.to_string());
-
-            if let Some(value_for_digest) =
-                self.hash_to_decoded_disclosure.get(digest)
-            {
-                let disclosure =
-                    value_for_digest
-                        .as_array()
-                        .ok_or(Error::InvalidArrayDisclosureObject(
-                            value_for_digest.to_string(),
-                        ))?;
-                let key = disclosure[1]
-                    .as_str()
-                    .ok_or(Error::ConversionError("str".to_string()))?
-                    .to_owned();
-                let value = disclosure[2].clone();
-                if pre_output.contains_key(&key) {
-                    return Err(Error::DuplicateKeyError(key.to_string()));
-                }
-                let unpacked_value = self.unpack_disclosed_claims(&value)?;
-                pre_output.insert(key, unpacked_value);
-            } else {
-                debug!("Digest {:?} skipped as decoy", digest)
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unpack_from_digest(
-        &mut self,
-        digest: &Value,
-    ) -> Result<Option<Value>> {
-        let digest = digest
-            .as_str()
-            .ok_or(Error::ConversionError("str".to_string()))?;
-        if self.duplicate_hash_check.contains(&digest.to_string()) {
-            return Err(Error::DuplicateDigestError(digest.to_string()));
-        }
-        self.duplicate_hash_check.push(digest.to_string());
-
-        if let Some(value_for_digest) =
-            self.hash_to_decoded_disclosure.get(digest)
-        {
-            let disclosure =
-                value_for_digest
-                    .as_array()
-                    .ok_or(Error::InvalidArrayDisclosureObject(
-                        value_for_digest.to_string(),
-                    ))?;
-
-            let value = disclosure[1].clone();
-            let unpacked_value = self.unpack_disclosed_claims(&value)?;
-            return Ok(Some(unpacked_value));
-        } else {
-            debug!("Digest {:?} skipped as decoy", digest)
-        }
-
-        Ok(None)
+        let mut seen = Vec::new();
+        crate::verifier::unpack_disclosed_claims(
+            &claims,
+            &self.hash_to_decoded_disclosure,
+            &mut seen,
+        )
     }
 }
 
