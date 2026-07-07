@@ -50,12 +50,15 @@ pub enum Error {
     #[error("signing error: {0}")]
     SigningError(String),
 
+    #[cfg(feature = "delegate")]
     #[error("malformed delegation chain: {0}")]
     ChainParseError(String),
 
+    #[cfg(feature = "delegate")]
     #[error("signature verification failed for chain link {link}: {reason}")]
     ChainSignatureFailed { link: usize, reason: String },
 
+    #[cfg(feature = "delegate")]
     #[error("typ mismatch on chain link {link}: found {found:?}, expected {expected}")]
     ChainTypMismatch {
         link: usize,
@@ -63,24 +66,31 @@ pub enum Error {
         expected: &'static str,
     },
 
+    #[cfg(feature = "delegate")]
     #[error("chain link {link} is missing both sd_hash and issuer_jwt_hash")]
     MissingChainBinding { link: usize },
 
+    #[cfg(feature = "delegate")]
     #[error("chain link {link} contains both sd_hash and issuer_jwt_hash")]
     AmbiguousChainBinding { link: usize },
 
+    #[cfg(feature = "delegate")]
     #[error("chain link {link} binding hash mismatch")]
     InvalidChainBinding { link: usize },
 
+    #[cfg(feature = "delegate")]
     #[error("invalid delegate payload: {0}")]
     InvalidDelegatePayload(String),
 
+    #[cfg(feature = "delegate")]
     #[error("token lifetime invalid: {component} has expired (exp={exp})")]
     ChainExpired { component: String, exp: i64 },
 
+    #[cfg(feature = "delegate")]
     #[error("token lifetime invalid: {component} is not yet valid (nbf={nbf})")]
     ChainNotYetValid { component: String, nbf: i64 },
 
+    #[cfg(feature = "delegate")]
     #[error("delegation chain depth {0} exceeds configured limit")]
     ChainDepthLimitExceeded(usize),
 

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end Delegate SD-JWT tests: Issuer -> SDJWTHolder -> SDJWTVerifier.
+#![cfg(feature = "delegate")]
 
 mod utils;
 

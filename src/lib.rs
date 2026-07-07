@@ -5,16 +5,20 @@
 use crate::error::Error;
 use crate::utils::{base64_hash, base64url_decode, jwt_payload_decode};
 
+use crate::error::Error::DeserializationError;
+#[cfg(feature = "delegate")]
+pub use delegate::ChainBindingMode;
 use error::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use strum::Display;
 use std::collections::HashMap;
+use strum::Display;
 pub use {
-    delegate::ChainBindingMode, holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy,
-    issuer::SDJWTIssuer, verifier::SDJWTVerifier,
+    holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy, issuer::SDJWTIssuer,
+    verifier::SDJWTVerifier,
 };
 
+#[cfg(feature = "delegate")]
 pub(crate) mod delegate;
 mod disclosure;
 pub mod error;
@@ -33,10 +37,14 @@ pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
 pub(crate) const SD_LIST_PREFIX: &str = "...";
 const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
 pub(crate) const KB_JWT_TYP_HEADER: &str = "kb+jwt";
+#[cfg(feature = "delegate")]
 pub(crate) const KB_SD_JWT_TYP_HEADER: &str = "kb+sd-jwt";
+#[cfg(feature = "delegate")]
 pub(crate) const KB_SD_JWT_KB_TYP_HEADER: &str = "kb+sd-jwt+kb";
 pub(crate) const KB_DIGEST_KEY: &str = "sd_hash";
+#[cfg(feature = "delegate")]
 pub(crate) const ISSUER_JWT_HASH_KEY: &str = "issuer_jwt_hash";
+#[cfg(feature = "delegate")]
 pub(crate) const DELEGATE_PAYLOAD_KEY: &str = "delegate_payload";
 pub const COMBINED_SERIALIZATION_FORMAT_SEPARATOR: &str = "~";
 pub(crate) const JWT_SEPARATOR: &str = ".";
@@ -45,6 +53,7 @@ pub(crate) const JWK_KEY: &str = "jwk";
 
 /// Maximum chain depth the verifier accepts (number of KB-SD-JWT links between the
 /// issuer-signed JWT and the final KB-JWT). Protects against runaway recursion / DoS.
+#[cfg(feature = "delegate")]
 pub const MAX_DELEGATION_DEPTH: usize = 32;
 
 /// SDJWTSerializationFormat is used to determine how an SD-JWT is serialized to String
@@ -69,6 +78,7 @@ pub(crate) struct SDJWTCommon {
     hash_to_disclosure: HashMap<String, String>,
     input_disclosures: Vec<String>,
     sign_alg: Option<String>,
+    #[cfg(feature = "delegate")]
     pub(crate) delegation_chain: Option<delegate::DelegationChain>,
 }
 
@@ -144,6 +154,7 @@ impl SDJWTCommon {
         // Detect delegation chain first; if present, populate `delegation_chain` and the
         // legacy fields that downstream code reads (issuer JWT + its forwarded disclosures
         // + optional final KB-JWT). Otherwise fall through to the legacy parser.
+        #[cfg(feature = "delegate")]
         if let Some(chain) = delegate::DelegationChain::try_parse_compact(&sd_jwt_with_disclosures)?
         {
             self.sign_alg = Self::decode_header_and_get_sign_algorithm(&chain.issuer_jwt);
@@ -168,7 +179,8 @@ impl SDJWTCommon {
         let parts: Vec<&str> = sd_jwt_with_disclosures
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
-        if parts.len() < 2 { // minimal number of SD-JWT parts according to the standard
+        if parts.len() < 2 {
+            // minimal number of SD-JWT parts according to the standard
             return Err(Error::InvalidInput(format!(
                 "Invalid SD-JWT length: {}",
                 parts.len()
@@ -222,23 +234,17 @@ impl SDJWTCommon {
             Some(jwt_payload_decode(&parsed_sd_jwt_json.payload)?);
         let sd_jwt = format!(
             "{}.{}.{}",
-            parsed_sd_jwt_json.protected,
-            parsed_sd_jwt_json.payload,
-            parsed_sd_jwt_json.signature
-        );    
+            parsed_sd_jwt_json.protected, parsed_sd_jwt_json.payload, parsed_sd_jwt_json.signature
+        );
         self.unverified_sd_jwt = Some(sd_jwt.clone());
-        self.sign_alg = Self::decode_header_and_get_sign_algorithm(&sd_jwt);    
+        self.sign_alg = Self::decode_header_and_get_sign_algorithm(&sd_jwt);
         Ok(())
     }
 
     fn parse_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         match self.serialization_format {
-            SDJWTSerializationFormat::Compact => {
-                self.parse_compact_sd_jwt(sd_jwt_with_disclosures)
-            }
-            SDJWTSerializationFormat::JSON => {
-                self.parse_json_sd_jwt(sd_jwt_with_disclosures)
-            }
+            SDJWTSerializationFormat::Compact => self.parse_compact_sd_jwt(sd_jwt_with_disclosures),
+            SDJWTSerializationFormat::JSON => self.parse_json_sd_jwt(sd_jwt_with_disclosures),
         }
     }
     /// Decodes a header jwt string and extracts the "alg" field from the JSON object.
@@ -255,7 +261,8 @@ impl SDJWTCommon {
         let decoded = base64url_decode(jwt_header).ok()?;
         let decoded_str = std::str::from_utf8(&decoded).ok()?;
         let json_sign_alg: Value = serde_json::from_str(decoded_str).ok()?;
-        let sign_alg = json_sign_alg.get("alg")
+        let sign_alg = json_sign_alg
+            .get("alg")
             .and_then(Value::as_str)
             .map(String::from);
         sign_alg
@@ -264,11 +271,16 @@ impl SDJWTCommon {
     /// Unpack all disclosed claims of an issuer-signed SD-JWT payload. Used by
     /// [`crate::utils::decode_sd_jwt`] and shares the disclosure-unpacking logic
     /// with the verifier (see [`crate::verifier::unpack_disclosed_claims`]).
-    pub(crate) fn extract_sd_claims(&mut self, sd_jwt_payload: &Map<String, Value>) -> Result<Value> {
+    pub(crate) fn extract_sd_claims(&self) -> Result<Value> {
+        let sd_jwt_payload = self
+            .unverified_input_sd_jwt_payload
+            .as_ref()
+            .ok_or_else(|| DeserializationError("SD-JWT has no payload".to_string()))?;
+
         if sd_jwt_payload.contains_key(DIGEST_ALG_KEY)
             && sd_jwt_payload[DIGEST_ALG_KEY] != DEFAULT_DIGEST_ALG
         {
-            return Err(Error::DeserializationError(format!(
+            return Err(DeserializationError(format!(
                 "Invalid hash algorithm {}",
                 sd_jwt_payload[DIGEST_ALG_KEY]
             )));
@@ -276,11 +288,7 @@ impl SDJWTCommon {
 
         let claims: Value = sd_jwt_payload.clone().into_iter().collect();
         let mut seen = Vec::new();
-        crate::verifier::unpack_disclosed_claims(
-            &claims,
-            &self.hash_to_decoded_disclosure,
-            &mut seen,
-        )
+        verifier::unpack_disclosed_claims(&claims, &self.hash_to_decoded_disclosure, &mut seen)
     }
 }
 
@@ -288,15 +296,24 @@ impl SDJWTCommon {
 mod tests {
     use crate::{utils, SDJWTCommon};
 
-
     #[test]
-    fn test_parse_compact_sd_jwt(){
+    fn test_parse_compact_sd_jwt() {
         let mut sdjwt = SDJWTCommon::default();
         let encoded_empty_object = utils::base64url_encode("{}".as_bytes());
-        sdjwt.parse_compact_sd_jwt(format!("jwt1.{encoded_empty_object}.jwt3~disc1~disc2~kbjwt")).unwrap();
-        assert_eq!(sdjwt.unverified_sd_jwt.unwrap(), format!("jwt1.{encoded_empty_object}.jwt3"));
+        sdjwt
+            .parse_compact_sd_jwt(format!(
+                "jwt1.{encoded_empty_object}.jwt3~disc1~disc2~kbjwt"
+            ))
+            .unwrap();
+        assert_eq!(
+            sdjwt.unverified_sd_jwt.unwrap(),
+            format!("jwt1.{encoded_empty_object}.jwt3")
+        );
         assert_eq!(sdjwt.unverified_input_key_binding_jwt.unwrap(), "kbjwt");
-        assert_eq!(sdjwt.input_disclosures, vec!["disc1".to_string(), "disc2".to_string()]);
+        assert_eq!(
+            sdjwt.input_disclosures,
+            vec!["disc1".to_string(), "disc2".to_string()]
+        );
     }
 
     #[test]
@@ -306,8 +323,14 @@ mod tests {
         sdjwt.parse_json_sd_jwt(format!(
             "{{\"protected\":\"jwt1\",\"payload\":\"{encoded_empty_object}\",\"signature\":\"jwt3\",\"disclosures\":[\"disc1\",\"disc2\"],\"kb_jwt\":\"kbjwt\"}}"
         )).unwrap();
-        assert_eq!(sdjwt.unverified_sd_jwt.unwrap(), format!("jwt1.{encoded_empty_object}.jwt3"));
+        assert_eq!(
+            sdjwt.unverified_sd_jwt.unwrap(),
+            format!("jwt1.{encoded_empty_object}.jwt3")
+        );
         assert_eq!(sdjwt.unverified_input_key_binding_jwt.unwrap(), "kbjwt");
-        assert_eq!(sdjwt.input_disclosures, vec!["disc1".to_string(), "disc2".to_string()]);
+        assert_eq!(
+            sdjwt.input_disclosures,
+            vec!["disc1".to_string(), "disc2".to_string()]
+        );
     }
 }

@@ -12,6 +12,9 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
 mock_salts = ["lazy_static"]
+# Delegate SD-JWT (dSD-JWT / dSD-JWT+KB) support: chain delegation on the holder
+# and chain verification on the verifier. Off by default.
+delegate = []
 
 [dependencies]
 base64 = "0.21"

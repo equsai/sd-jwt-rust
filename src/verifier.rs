@@ -2,9 +2,9 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::SDJWTSerializationFormat;
 use crate::error::Error;
 use crate::error::Result;
+use crate::SDJWTSerializationFormat;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use log::debug;
@@ -16,14 +16,18 @@ use std::str::FromStr;
 use std::string::String;
 use std::vec::Vec;
 
+#[cfg(feature = "delegate")]
 use crate::delegate::{compute_issuer_jwt_hash, compute_sd_hash};
 use crate::resolver::KeyResolver;
 use crate::utils::base64_hash;
 use crate::{
     SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
-    DEFAULT_SIGNING_ALG, DELEGATE_PAYLOAD_KEY, DIGEST_ALG_KEY, ISSUER_JWT_HASH_KEY, JWK_KEY,
-    KB_DIGEST_KEY, KB_JWT_TYP_HEADER, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER, SD_DIGESTS_KEY,
+    DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER, SD_DIGESTS_KEY,
     SD_LIST_PREFIX,
+};
+#[cfg(feature = "delegate")]
+use crate::{
+    DELEGATE_PAYLOAD_KEY, ISSUER_JWT_HASH_KEY, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER,
 };
 
 pub struct SDJWTVerifier {
@@ -39,10 +43,12 @@ pub struct SDJWTVerifier {
     /// Per-link `cnf` JWKs extracted while walking a delegation chain. Empty for a
     /// plain SD-JWT(+KB). The last entry (when present) is the final Delegate
     /// Holder's key, used to verify the trailing KB-JWT of a dSD-JWT+KB.
+    #[cfg(feature = "delegate")]
     pub chain_cnfs: Vec<Jwk>,
 
     /// The disclosed Delegate Payload of each KB-SD-JWT link, in chain order.
     /// Empty when the input is not a delegation chain.
+    #[cfg(feature = "delegate")]
     pub verified_delegate_payloads: Vec<Map<String, Value>>,
 
     issuer_key_resolver: Box<dyn KeyResolver>,
@@ -65,7 +71,9 @@ impl SDJWTVerifier {
             issuer_key_resolver,
             sd_jwt_engine: Default::default(),
             verified_claims: Value::Null,
+            #[cfg(feature = "delegate")]
             chain_cnfs: Vec::new(),
+            #[cfg(feature = "delegate")]
             verified_delegate_payloads: Vec::new(),
         }
     }
@@ -105,60 +113,22 @@ impl SDJWTVerifier {
 
         // For a delegation chain, walk the holder-signed KB-SD-JWT links, layering
         // each disclosed Delegate Payload onto `verified_claims`.
+        #[cfg(feature = "delegate")]
         if self.sd_jwt_engine.delegation_chain.is_some() {
             self.verify_delegation_chain()?;
         }
 
         if let (Some(expected_aud), Some(expected_nonce)) = (&expected_aud, &expected_nonce) {
-            if let Some(chain) = self.sd_jwt_engine.delegation_chain.clone() {
-                if let Some(kb_jwt) = chain.trailing_kb_jwt.as_ref() {
-                    // dSD-JWT+KB: the trailing KB-JWT binds to the final link and is
-                    // signed by the final Delegate Holder's key.
-                    let last_jwk = self.chain_cnfs.last().ok_or_else(|| {
-                        Error::InvalidDelegatePayload(
-                            "trailing KB-JWT present but chain produced no cnf for final binding"
-                                .into(),
-                        )
-                    })?;
-                    let expected_sd_hash = chain.final_kb_sd_hash().ok_or_else(|| {
-                        Error::InvalidState("delegation chain present but has no links".into())
-                    })?;
-                    verify_final_kb_jwt(
-                        kb_jwt,
-                        last_jwk,
-                        expected_aud,
-                        expected_nonce,
-                        &expected_sd_hash,
-                    )?;
-                } else {
-                    // Plain dSD-JWT (no trailing KB-JWT): the credential was delegated
-                    // to this Verifier, so the final KB-SD-JWT link IS the key binding.
-                    // Per the Delegate SD-JWT spec, the claims a KB-JWT would carry
-                    // (`aud`, `nonce`) live in that link's Delegate Payload instead. The
-                    // chain walk already signature-verified the link and captured its
-                    // disclosed Delegate Payload, so validate `aud`/`nonce` there.
-                    let final_payload = self.verified_delegate_payloads.last().ok_or_else(|| {
-                        Error::InvalidDelegatePayload(
-                            "expected_aud/expected_nonce were provided but the delegation chain \
-                             produced no Delegate Payload to bind them"
-                                .into(),
-                        )
-                    })?;
-                    verify_delegate_payload_binding(final_payload, expected_aud, expected_nonce)?;
-                }
+            // A delegation chain binds `aud`/`nonce` to the final link
+            // (or its trailing KB-JWT) rather than a plain KB-JWT;
+            #[cfg(feature = "delegate")]
+            if self.sd_jwt_engine.delegation_chain.is_some() {
+                self.verify_chain_key_binding(expected_aud, expected_nonce)?;
             } else {
-                let sign_alg = self.sd_jwt_engine.unverified_input_key_binding_jwt
-                    .as_ref()
-                    .and_then(|value| {
-                        SDJWTCommon::decode_header_and_get_sign_algorithm(value)
-                    });
-
-                self.verify_key_binding_jwt(
-                    expected_aud.to_owned(),
-                    expected_nonce.to_owned(),
-                    sign_alg.as_deref(),
-                )?;
+                self.verify_key_binding_jwt(expected_aud.to_owned(), expected_nonce.to_owned())?;
             }
+            #[cfg(not(feature = "delegate"))]
+            self.verify_key_binding_jwt(expected_aud.to_owned(), expected_nonce.to_owned())?;
         } else if expected_aud.is_some() || expected_nonce.is_some() {
             return Err(Error::InvalidInput(
                 "Either both expected_aud and expected_nonce must be provided or both must be None"
@@ -169,12 +139,59 @@ impl SDJWTVerifier {
         Ok(self.verified_claims.clone())
     }
 
+    #[cfg(feature = "delegate")]
+    fn verify_chain_key_binding(&self, expected_aud: &str, expected_nonce: &str) -> Result<bool> {
+        let chain = self
+            .sd_jwt_engine
+            .delegation_chain
+            .as_ref()
+            .ok_or_else(|| Error::Unspecified("token is not a dSD-JWT".to_string()))?;
+        if let Some(kb_jwt) = chain.trailing_kb_jwt.as_ref() {
+            // dSD-JWT+KB: the trailing KB-JWT binds to the final link and is
+            // signed by the final Delegate Holder's key.
+            let last_jwk = self.chain_cnfs.last().ok_or_else(|| {
+                Error::InvalidDelegatePayload(
+                    "trailing KB-JWT present but chain produced no cnf for final binding".into(),
+                )
+            })?;
+            let expected_sd_hash = chain.final_kb_sd_hash().ok_or_else(|| {
+                Error::InvalidState("delegation chain present but has no links".into())
+            })?;
+            verify_kb_jwt(
+                kb_jwt,
+                last_jwk,
+                expected_aud,
+                expected_nonce,
+                Some(&expected_sd_hash),
+            )?;
+        } else {
+            // Plain dSD-JWT (no trailing KB-JWT): the credential was delegated
+            // to this Verifier, so the final KB-SD-JWT link IS the key binding.
+            // Per the Delegate SD-JWT spec, the claims a KB-JWT would carry
+            // (`aud`, `nonce`) live in that link's Delegate Payload instead. The
+            // chain walk already signature-verified the link and captured its
+            // disclosed Delegate Payload, so validate `aud`/`nonce` there.
+            let final_payload = self.verified_delegate_payloads.last().ok_or_else(|| {
+                Error::InvalidDelegatePayload(
+                    "expected_aud/expected_nonce were provided but the delegation chain \
+                     produced no Delegate Payload to bind them"
+                        .into(),
+                )
+            })?;
+            verify_delegate_payload_binding(final_payload, expected_aud, expected_nonce)?;
+        }
+        Ok(true)
+    }
+
     fn reset(&mut self) {
         self.sd_jwt_payload = Default::default();
         self._holder_public_key_payload = None;
         self.verified_claims = Value::Null;
-        self.chain_cnfs = Vec::new();
-        self.verified_delegate_payloads = Vec::new();
+        #[cfg(feature = "delegate")]
+        {
+            self.chain_cnfs = Vec::new();
+            self.verified_delegate_payloads = Vec::new();
+        }
     }
 
     /// Walk the delegation chain. Called after `verify_sd_jwt` has verified the
@@ -182,6 +199,7 @@ impl SDJWTVerifier {
     /// initial `verified_claims`. Each KB-SD-JWT link is signature-, binding-, and
     /// `typ`-verified; its single disclosed Delegate Payload is layered onto
     /// `verified_claims` and recorded in `verified_delegate_payloads`.
+    #[cfg(feature = "delegate")]
     fn verify_delegation_chain(&mut self) -> Result<()> {
         let chain = self
             .sd_jwt_engine
@@ -243,9 +261,9 @@ impl SDJWTVerifier {
             let decoded =
                 jsonwebtoken::decode::<Map<String, Value>>(&link.jwt, &decoding_key, &validation)
                     .map_err(|e| Error::ChainSignatureFailed {
-                        link: idx,
-                        reason: e.to_string(),
-                    })?;
+                    link: idx,
+                    reason: e.to_string(),
+                })?;
             let typ = decoded.header.typ.clone();
             let payload = decoded.claims;
 
@@ -289,8 +307,11 @@ impl SDJWTVerifier {
 
             // Unpack the link payload against the shared disclosure map.
             let mut seen = Vec::new();
-            let unpacked =
-                unpack_disclosed_claims(&Value::Object(payload.clone()), &hash_to_decoded, &mut seen)?;
+            let unpacked = unpack_disclosed_claims(
+                &Value::Object(payload.clone()),
+                &hash_to_decoded,
+                &mut seen,
+            )?;
             let unpacked_obj = unpacked.as_object().cloned().ok_or_else(|| {
                 Error::InvalidDelegatePayload(format!(
                     "link {}: unpacked KB-SD-JWT payload is not an object",
@@ -320,7 +341,8 @@ impl SDJWTVerifier {
                     existing.insert(k.clone(), v.clone());
                 }
             }
-            self.verified_delegate_payloads.push(delegate_payload.clone());
+            self.verified_delegate_payloads
+                .push(delegate_payload.clone());
 
             // Extract next-hop cnf from the Delegate Payload, if applicable.
             if is_kb_kb {
@@ -377,11 +399,7 @@ impl SDJWTVerifier {
         let mut validation = Validation::new(algorithm);
         // exp claim is required by library but is optional according to the spec (https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1.4)
         validation.required_spec_claims.remove("exp");
-        let claims = jsonwebtoken::decode(
-            sd_jwt,
-            &issuer_public_key,
-            &validation,
-        )
+        let claims = jsonwebtoken::decode(sd_jwt, &issuer_public_key, &validation)
             .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {}", e)))?
             .claims;
 
@@ -401,9 +419,7 @@ impl SDJWTVerifier {
         &mut self,
         expected_aud: String,
         expected_nonce: String,
-        sign_alg: Option<&str>,
     ) -> Result<()> {
-        let sign_alg = sign_alg.unwrap_or(DEFAULT_SIGNING_ALG);
         let holder_public_key_payload_jwk = match &self._holder_public_key_payload {
             None => {
                 return Err(Error::KeyNotFound(
@@ -418,55 +434,28 @@ impl SDJWTVerifier {
                 }
             }
         };
-        let pubkey: DecodingKey = match serde_json::from_value::<Jwk>(holder_public_key_payload_jwk)
-        {
-            Ok(jwk) => {
-                if let Ok(pubkey) = DecodingKey::from_jwk(&jwk) {
-                    pubkey
-                } else {
-                    return Err(Error::DeserializationError(
-                        "Cannot parse DecodingKey from json".to_string(),
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(Error::DeserializationError(
-                    "Cannot parse JWK from json".to_string(),
-                ));
-            }
-        };
-        let key_binding_jwt = match &self.sd_jwt_engine.unverified_input_key_binding_jwt {
-            Some(payload) => {
-                let mut validation = Validation::new(
-                    Algorithm::from_str(sign_alg)
-                        .map_err(|e| Error::DeserializationError(e.to_string()))?,
-                );
-                validation.set_audience(&[&expected_aud]);
-                validation.set_required_spec_claims(&["aud"]);
-
-                jsonwebtoken::decode::<Map<String, Value>>(&payload, &pubkey, &validation)
-                    .map_err(|e| Error::DeserializationError(e.to_string()))?
-            }
-            None => {
-                return Err(Error::InvalidState(
-                    "Cannot take Key Binding JWK from String".to_string(),
-                ));
-            }
-        };
-        if key_binding_jwt.header.typ != Some(KB_JWT_TYP_HEADER.to_string()) {
-            return Err(Error::InvalidInput("Invalid header type".to_string()));
-        }
-        if key_binding_jwt.claims.get("nonce") != Some(&Value::String(expected_nonce)) {
-            return Err(Error::InvalidInput("Invalid nonce".to_string()));
-        }
-        if self.sd_jwt_engine.serialization_format == SDJWTSerializationFormat::Compact {
-            let sd_hash = self._get_key_binding_digest_hash()?;
-            if key_binding_jwt.claims.get(KB_DIGEST_KEY) != Some(&Value::String(sd_hash)) {
-                return Err(Error::InvalidInput("Invalid digest in KB-JWT".to_string()));
-            }
-        }
-
-        Ok(())
+        let holder_jwk = serde_json::from_value::<Jwk>(holder_public_key_payload_jwk)
+            .map_err(|_| Error::DeserializationError("Cannot parse JWK from json".to_string()))?;
+        let kb_jwt = self
+            .sd_jwt_engine
+            .unverified_input_key_binding_jwt
+            .clone()
+            .ok_or_else(|| {
+                Error::InvalidState("Cannot take Key Binding JWK from String".to_string())
+            })?;
+        let expected_sd_hash =
+            if self.sd_jwt_engine.serialization_format == SDJWTSerializationFormat::Compact {
+                Some(self._get_key_binding_digest_hash()?)
+            } else {
+                None
+            };
+        verify_kb_jwt(
+            &kb_jwt,
+            &holder_jwk,
+            &expected_aud,
+            &expected_nonce,
+            expected_sd_hash.as_deref(),
+        )
     }
 
     fn _get_key_binding_digest_hash(&mut self) -> Result<String> {
@@ -476,7 +465,7 @@ impl SDJWTVerifier {
             self.sd_jwt_engine
                 .unverified_sd_jwt
                 .as_ref()
-                .ok_or(Error::ConversionError("reference".to_string()))?
+                .ok_or(Error::ConversionError("reference".to_string()))?,
         );
         combined.extend(
             self.sd_jwt_engine
@@ -514,9 +503,11 @@ impl SDJWTVerifier {
 /// Leeway (seconds) applied to `exp`/`nbf` checks, matching `jsonwebtoken`'s
 /// default so chain-component lifetime validation is consistent with the
 /// issuer-JWT validation done during `verify_sd_jwt`.
+#[cfg(feature = "delegate")]
 const LIFETIME_LEEWAY_SECS: i64 = 60;
 
 /// Current time as seconds since the Unix epoch.
+#[cfg(feature = "delegate")]
 fn now_secs() -> Result<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -527,6 +518,7 @@ fn now_secs() -> Result<u64> {
 /// Read a NumericDate claim (`exp`/`nbf`). Accepts a JSON number (integer or
 /// truncated float) or a numeric string; returns `None` if the claim is absent or
 /// not a parseable timestamp.
+#[cfg(feature = "delegate")]
 fn claim_timestamp(claims: &Map<String, Value>, key: &str) -> Option<i64> {
     match claims.get(key) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -538,6 +530,7 @@ fn claim_timestamp(claims: &Map<String, Value>, key: &str) -> Option<i64> {
 /// Enforce a chain component's `exp`/`nbf` (if present) against `now`, with
 /// [`LIFETIME_LEEWAY_SECS`] of clock skew tolerance. `component` names the source
 /// (e.g. `"issuer-signed JWT"`, `"chain link 1"`) for error reporting.
+#[cfg(feature = "delegate")]
 fn validate_lifetime(claims: &Map<String, Value>, component: &str, now: u64) -> Result<()> {
     let now = now as i64;
     if let Some(exp) = claim_timestamp(claims, "exp") {
@@ -559,19 +552,17 @@ fn validate_lifetime(claims: &Map<String, Value>, component: &str, now: u64) -> 
     Ok(())
 }
 
-/// Verify the trailing KB-JWT of a dSD-JWT+KB against the final Delegate Holder's
-/// `cnf`, checking `typ`, `aud`, `nonce`, and `sd_hash`.
-fn verify_final_kb_jwt(
+fn verify_kb_jwt(
     kb_jwt: &str,
     holder_jwk: &Jwk,
     expected_aud: &str,
     expected_nonce: &str,
-    expected_sd_hash: &str,
+    expected_sd_hash: Option<&str>,
 ) -> Result<()> {
     let sign_alg = SDJWTCommon::decode_header_and_get_sign_algorithm(kb_jwt)
         .unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
     let pubkey = DecodingKey::from_jwk(holder_jwk).map_err(|e| {
-        Error::DeserializationError(format!("Cannot parse DecodingKey from final cnf: {}", e))
+        Error::DeserializationError(format!("Cannot parse DecodingKey from json: {}", e))
     })?;
     let mut validation = Validation::new(
         Algorithm::from_str(&sign_alg).map_err(|e| Error::DeserializationError(e.to_string()))?,
@@ -588,8 +579,10 @@ fn verify_final_kb_jwt(
     if decoded.claims.get("nonce") != Some(&Value::String(expected_nonce.to_string())) {
         return Err(Error::InvalidInput("Invalid nonce".to_string()));
     }
-    if decoded.claims.get(KB_DIGEST_KEY) != Some(&Value::String(expected_sd_hash.to_string())) {
-        return Err(Error::InvalidInput("Invalid digest in KB-JWT".to_string()));
+    if let Some(expected_sd_hash) = expected_sd_hash {
+        if decoded.claims.get(KB_DIGEST_KEY) != Some(&Value::String(expected_sd_hash.to_string())) {
+            return Err(Error::InvalidInput("Invalid digest in KB-JWT".to_string()));
+        }
     }
     Ok(())
 }
@@ -602,6 +595,7 @@ fn verify_final_kb_jwt(
 /// Payload. The payload's signature was already verified during the chain walk, so
 /// here we only confirm the bound audience and nonce match what the Verifier
 /// expects. `aud` may be a single string or an array containing the expected value.
+#[cfg(feature = "delegate")]
 fn verify_delegate_payload_binding(
     delegate_payload: &Map<String, Value>,
     expected_aud: &str,
@@ -628,6 +622,7 @@ fn verify_delegate_payload_binding(
 /// Return the single disclosed Delegate Payload object of a link, i.e. the one
 /// element of the (unpacked) `delegate_payload` array. Assumes
 /// [`enforce_delegate_payload_rule`] has already validated the array.
+#[cfg(feature = "delegate")]
 fn disclosed_delegate_payload(
     link_idx: usize,
     unpacked_obj: &Map<String, Value>,
@@ -658,6 +653,7 @@ fn disclosed_delegate_payload(
 
 /// Enforce the `delegate_payload` array rules: non-empty; all-inline (single) or
 /// all-digest-stubs (multi); and, when stubs are used, exactly one disclosed.
+#[cfg(feature = "delegate")]
 fn enforce_delegate_payload_rule(
     link_idx: usize,
     raw_payload: &Map<String, Value>,
@@ -682,8 +678,9 @@ fn enforce_delegate_payload_rule(
     let stub_count = raw_arr
         .iter()
         .filter(|v| {
-            v.as_object()
-                .map_or(false, |obj| obj.contains_key(SD_LIST_PREFIX) && obj.len() == 1)
+            v.as_object().map_or(false, |obj| {
+                obj.contains_key(SD_LIST_PREFIX) && obj.len() == 1
+            })
         })
         .count();
     if stub_count > 0 && stub_count != raw_arr.len() {
@@ -819,11 +816,12 @@ fn unpack_from_digests(
         seen.push(digest.to_string());
 
         if let Some(value_for_digest) = hash_to_decoded.get(digest) {
-            let disclosure = value_for_digest
-                .as_array()
-                .ok_or(Error::InvalidArrayDisclosureObject(
-                    value_for_digest.to_string(),
-                ))?;
+            let disclosure =
+                value_for_digest
+                    .as_array()
+                    .ok_or(Error::InvalidArrayDisclosureObject(
+                        value_for_digest.to_string(),
+                    ))?;
             let key = disclosure[1]
                 .as_str()
                 .ok_or(Error::ConversionError("str".to_string()))?
@@ -874,12 +872,12 @@ fn unpack_from_digest(
 
 #[cfg(test)]
 mod tests {
-    use async_std_test::async_test;
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
-    use crate::{SDJWTHolder, SDJWTIssuer, SDJWTVerifier, SDJWTSerializationFormat};
+    use crate::key::{SDJWTKey, SDJWTPubKey};
+    use crate::{SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat, SDJWTVerifier};
+    use async_std_test::async_test;
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use serde_json::{json, Value};
-    use crate::key::{ SDJWTKey, SDJWTPubKey };
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
     const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
@@ -913,17 +911,19 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation::<SDJWTKey>(
@@ -932,11 +932,14 @@ mod tests {
                 None,
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(sd_jwt, presentation);
 
         let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+            .unwrap()
+            .into();
 
         let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
             .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
@@ -964,17 +967,19 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
 
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
             .unwrap()
@@ -984,11 +989,14 @@ mod tests {
                 None,
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(sd_jwt, presentation);
 
         let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+            .unwrap()
+            .into();
 
         let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
             .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
@@ -1031,7 +1039,7 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
         let strategy = ClaimsForSelectiveDisclosureStrategy::Custom(vec![
             "$.name",
@@ -1039,15 +1047,17 @@ mod tests {
             "$.addresses[1].country",
             "$.nationalities[0]",
         ]);
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            strategy,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                strategy,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
 
         let mut claims_to_disclose = user_claims.clone();
         claims_to_disclose["addresses"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
@@ -1061,10 +1071,13 @@ mod tests {
                 None,
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+            .unwrap()
+            .into();
 
         let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
             .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
@@ -1126,7 +1139,7 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
         let strategy = ClaimsForSelectiveDisclosureStrategy::Custom(vec![
             "$.array_with_recursive_sd[1]",
@@ -1136,15 +1149,17 @@ mod tests {
             "$.test2[0]",
             "$.test2[1]",
         ]);
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            strategy,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                strategy,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
 
         let claims_to_disclose = json!({});
 
@@ -1156,10 +1171,13 @@ mod tests {
                 None,
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let public_issuer_bytes = PUBLIC_ISSUER_PEM.as_bytes();
-        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes).unwrap().into();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(public_issuer_bytes)
+            .unwrap()
+            .into();
 
         let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
             .verify_presentation(presentation, None, None, SDJWTSerializationFormat::Compact)
@@ -1185,8 +1203,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn verify_full_presentation_to_allow_other_algorithms_json_format() -> std::io::Result<()> {
-
+    async fn verify_full_presentation_to_allow_other_algorithms_json_format() -> std::io::Result<()>
+    {
         let user_claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -1202,17 +1220,19 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_ED25519_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ed_pem(private_issuer_bytes).unwrap(),
-            Some("EdDSA".to_string())
+            Some("EdDSA".to_string()),
         );
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
-            None,
-            false,
-            SDJWTSerializationFormat::JSON, // Changed to Json format
-            None,
-        )
-        .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                None,
+                false,
+                SDJWTSerializationFormat::JSON, // Changed to Json format
+                None,
+            )
+            .await
+            .unwrap();
 
         let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::JSON) // Changed to Json format
             .unwrap()
@@ -1220,13 +1240,16 @@ mod tests {
                 user_claims.as_object().unwrap().clone(),
                 None,
                 None,
-                None
+                None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(sd_jwt, presentation);
 
         let public_issuer_bytes = PUBLIC_ISSUER_ED25519_PEM.as_bytes();
-        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ed_pem(public_issuer_bytes).unwrap().into();
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ed_pem(public_issuer_bytes)
+            .unwrap()
+            .into();
 
         let verified_claims = SDJWTVerifier::new(Box::new(issuer_pub_key))
             .verify_presentation(presentation, None, None, SDJWTSerializationFormat::JSON)
@@ -1237,7 +1260,8 @@ mod tests {
         Ok(())
     }
     #[async_test]
-    async fn verify_presentation_when_sd_jwt_uses_es256_and_key_binding_uses_eddsa() -> std::io::Result<()> {
+    async fn verify_presentation_when_sd_jwt_uses_es256_and_key_binding_uses_eddsa(
+    ) -> std::io::Result<()> {
         let user_claims = json!({
             "address": {
                 "street_address": "Schulstr. 12",
