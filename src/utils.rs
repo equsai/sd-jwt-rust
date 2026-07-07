@@ -10,6 +10,8 @@ use error::Result;
 use jsonwebtoken::Header;
 #[cfg(feature = "mock_salts")]
 use lazy_static::lazy_static;
+#[cfg(feature = "delegate")]
+use crate::DELEGATE_PAYLOAD_KEY;
 use rand::prelude::ThreadRng;
 use rand::RngCore;
 use serde::Serialize;
@@ -41,14 +43,77 @@ pub fn decode_sd_jwt(
     };
 
     sd_jwt_engine.parse_sd_jwt(sd_jwt)?;
+    sd_jwt_engine.create_hash_mappings()?;
+    sd_jwt_engine.extract_sd_claims()
+}
 
-    let payload = sd_jwt_engine
-        .unverified_input_sd_jwt_payload
-        .clone()
-        .ok_or_else(|| DeserializationError("Failed to parse SD-JWT".to_string()))?;
+/// Decodes a Delegate SD-JWT (dSD-JWT / dSD-JWT+KB) and returns one claims object
+/// per component, in chain order:
+///
+/// - element `0` is the issuer-signed SD-JWT's claims with disclosures resolved,
+///   exactly as [`decode_sd_jwt`] would return them;
+/// - each subsequent element is the corresponding chain link's `delegate_payload`
+///   with its disclosures resolved — i.e. the delegated claims. When a link
+///   discloses a single alternative (the usual presented case) that object is
+///   returned; when several alternatives are still disclosed they are returned as
+///   a JSON array.
+///
+/// Like [`decode_sd_jwt`], the result is *unverified*: no signatures, chain
+/// bindings, `typ`, or lifetimes are checked. A plain SD-JWT (no chain) yields a
+/// single-element vector, matching [`decode_sd_jwt`] wrapped in a `Vec`.
+///
+/// # Parameters
+///
+/// - `dsd_jwt` - The Delegate SD-JWT to decode.
+/// - `serialization_format` - The serialization format, see [SDJWTSerializationFormat].
+///
+/// # Returns
+/// * `Vec<Value>` - The issuer claims followed by each link's resolved delegate payload.
+#[cfg(feature = "delegate")]
+pub fn decode_dsd_jwt(
+    dsd_jwt: String,
+    serialization_format: SDJWTSerializationFormat,
+) -> Result<Vec<Value>> {
+
+    let mut sd_jwt_engine = SDJWTCommon {
+        serialization_format,
+        ..Default::default()
+    };
+
+    sd_jwt_engine.parse_sd_jwt(dsd_jwt)?;
     sd_jwt_engine.create_hash_mappings()?;
 
-    sd_jwt_engine.extract_sd_claims(&payload)
+    // First element: the issuer SD-JWT's claims with disclosures resolved.
+    let mut components = vec![sd_jwt_engine.extract_sd_claims()?];
+
+    // Remaining elements: each chain link's delegate_payload, disclosures resolved.
+    if let Some(chain) = sd_jwt_engine.delegation_chain.clone() {
+        for (idx, link) in chain.links.iter().enumerate() {
+            let claims: Value = link.payload.clone().into_iter().collect();
+            let unpacked = crate::verifier::unpack_disclosed_claims(
+                &claims,
+                &sd_jwt_engine.hash_to_decoded_disclosure,
+                &mut Vec::new(),
+            )?;
+            let alternatives = unpacked
+                .as_object()
+                .and_then(|obj| obj.get(DELEGATE_PAYLOAD_KEY))
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    Error::InvalidDelegatePayload(format!(
+                        "link {}: delegate_payload is missing or not an array",
+                        idx
+                    ))
+                })?;
+            let delegate_payload = match alternatives.as_slice() {
+                [single] => single.clone(),
+                many => Value::Array(many.to_vec()),
+            };
+            components.push(delegate_payload);
+        }
+    }
+
+    Ok(components)
 }
 
 #[doc(hidden)]

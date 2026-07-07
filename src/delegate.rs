@@ -8,11 +8,12 @@
 //! used by [`SDJWTHolder::delegate`] and the verifier chain walk.
 
 use crate::error::{Error, Result};
-use crate::utils::{base64_hash, base64url_decode};
+use crate::utils::{base64_hash, base64url_decode, jwt_payload_decode};
 use crate::{
     COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DELEGATE_PAYLOAD_KEY, ISSUER_JWT_HASH_KEY,
     JWT_SEPARATOR, KB_DIGEST_KEY, MAX_DELEGATION_DEPTH, SD_LIST_PREFIX,
 };
+use serde_json::{Map, Value};
 
 /// How a KB-SD-JWT binds to the preceding component in the chain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,6 +31,7 @@ pub enum ChainBindingMode {
 #[derive(Clone, Debug)]
 pub(crate) struct ChainLink {
     pub jwt: String,
+    pub payload: Map<String, Value>,
     pub disclosures: Vec<String>,
 }
 
@@ -171,9 +173,18 @@ impl DelegationChain {
             if seg_idx == 0 {
                 issuer_disclosures = bucket;
             } else {
+                let link_jwt = tokens[seg_start];
+                let body = link_jwt.split(JWT_SEPARATOR).nth(1).ok_or_else(|| {
+                    Error::ChainParseError(format!(
+                        "chain-link KB-SD-JWT at index {} is not a valid JWT",
+                        seg_start
+                    ))
+                })?;
+                let payload = jwt_payload_decode(body)?;
                 links.push(ChainLink {
-                    jwt: tokens[seg_start].to_string(),
+                    jwt: link_jwt.to_string(),
                     disclosures: bucket,
+                    payload,
                 });
             }
         }
@@ -350,8 +361,11 @@ mod tests {
     use super::*;
 
     fn fake_jwt(tag: &str) -> String {
-        // Three non-empty segments separated by '.'; content irrelevant for tokenization.
-        format!("hdr-{tag}.body-{tag}.sig-{tag}")
+        // Three non-empty segments separated by '.'. The header and signature are
+        // opaque to the tokenizer, but the body must be a base64url-encoded JSON
+        // object because the parser now decodes each link's payload.
+        let body = crate::utils::base64url_encode(format!("{{\"tag\":\"{tag}\"}}").as_bytes());
+        format!("hdr-{tag}.{body}.sig-{tag}")
     }
 
     #[test]
@@ -381,6 +395,10 @@ mod tests {
         assert_eq!(chain.links.len(), 1);
         assert_eq!(chain.links[0].jwt, fake_jwt("kbsd1"));
         assert_eq!(chain.links[0].disclosures, vec!["D2".to_string()]);
+        assert_eq!(
+            chain.links[0].payload.get("tag").and_then(Value::as_str),
+            Some("kbsd1")
+        );
         assert!(chain.trailing_kb_jwt.is_none());
     }
 

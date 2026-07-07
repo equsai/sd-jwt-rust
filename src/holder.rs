@@ -5,23 +5,32 @@
 use crate::{error, SDJWTJson, SDJWTSerializationFormat};
 use error::{Error, Result};
 use jsonwebtoken::{Algorithm, Header};
-use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use serde_json::{Map, Value};
+#[cfg(feature = "delegate")]
+use serde_json::json;
+use std::collections::HashMap;
+#[cfg(feature = "delegate")]
+use std::collections::HashSet;
 use std::ops::Add;
 use std::str::FromStr;
 
+#[cfg(feature = "delegate")]
 use crate::delegate::{
     compute_issuer_jwt_hash, compute_sd_hash, link_binding_mode, link_delegate_payload_stubs,
     ChainBindingMode,
 };
+#[cfg(feature = "delegate")]
 use crate::disclosure::SDJWTDisclosure;
 use crate::signer::SDJWTSigner;
 use crate::utils::{base64_hash, encode};
 use crate::SDJWTCommon;
 use crate::{
-    CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
-    DELEGATE_PAYLOAD_KEY, DIGEST_ALG_KEY, ISSUER_JWT_HASH_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER,
-    KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER, SD_DIGESTS_KEY, SD_LIST_PREFIX,
+    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, KB_DIGEST_KEY, SD_DIGESTS_KEY, SD_LIST_PREFIX,
+};
+#[cfg(feature = "delegate")]
+use crate::{
+    CNF_KEY, DEFAULT_DIGEST_ALG, DELEGATE_PAYLOAD_KEY, DIGEST_ALG_KEY, ISSUER_JWT_HASH_KEY,
+    KB_JWT_TYP_HEADER, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER,
 };
 
 pub struct SDJWTHolder {
@@ -35,6 +44,7 @@ pub struct SDJWTHolder {
     sd_jwt_json: Option<SDJWTJson>,
     /// Which final-link `delegate_payload` alternative to disclose when presenting a
     /// delegation chain. `None` until `select_delegate_alternative` is called.
+    #[cfg(feature = "delegate")]
     selected_alternative: Option<usize>,
 }
 
@@ -65,6 +75,7 @@ impl SDJWTHolder {
             sd_jwt_payload: Map::new(),
             serialized_sd_jwt: "".to_string(),
             sd_jwt_json: None,
+            #[cfg(feature = "delegate")]
             selected_alternative: None,
         };
 
@@ -112,6 +123,7 @@ impl SDJWTHolder {
         // (→ dSD-JWT+KB). `claims_to_disclose` does not apply here — the issuer
         // claims forwarded into the chain were fixed at delegation time, and which
         // alternative to disclose is chosen via `select_delegate_alternative`.
+        #[cfg(feature = "delegate")]
         if let Some(chain) = self.sd_jwt_engine.delegation_chain.as_ref() {
             let last = chain
                 .links
@@ -231,6 +243,10 @@ impl SDJWTHolder {
         Ok(())
     }
 
+}
+
+#[cfg(feature = "delegate")]
+impl SDJWTHolder {
     /// True if the loaded credential is a dSD-JWT / dSD-JWT+KB chain (vs. a plain
     /// holder-bound SD-JWT awaiting its first delegation).
     pub fn is_delegated(&self) -> bool {
@@ -696,6 +712,7 @@ fn select_disclosures_from_disclosed_list(
 /// Sign one KB-SD-JWT chain link with a Holder's `cnf` private key and serialize it
 /// compactly (`<jwt>~<d1>~...~<dn>~`). The link signer lives here (not on
 /// `SDJWTIssuer`) because a chain link is signed by a Holder, not the Issuer.
+#[cfg(feature = "delegate")]
 async fn sign_kb_sd_jwt_link<S: SDJWTSigner>(
     signer: &S,
     typ_header: &str,
@@ -758,6 +775,7 @@ async fn sign_kb_sd_jwt_link<S: SDJWTSigner>(
 }
 
 /// Build a final KB-JWT (`typ=kb+jwt`) binding `sd_hash` to the presented chain.
+#[cfg(feature = "delegate")]
 async fn build_kb_jwt<S: SDJWTSigner>(
     nonce: String,
     aud: String,
