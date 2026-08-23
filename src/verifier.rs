@@ -308,7 +308,6 @@ impl SDJWTVerifier {
             }
             None => return Ok(issuer_claims),
         };
-        // `enforce_single = false`: open alternatives are legitimate here.
         let results = walk_delegation_chain(
             chain,
             &issuer_chain_cnf(&self.verified_claims)?,
