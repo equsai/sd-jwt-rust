@@ -5,9 +5,9 @@
 use crate::{error, SDJWTJson, SDJWTSerializationFormat};
 use error::{Error, Result};
 use jsonwebtoken::{Algorithm, Header};
-use serde_json::{Map, Value};
 #[cfg(feature = "delegate")]
 use serde_json::json;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 #[cfg(feature = "delegate")]
 use std::collections::HashSet;
@@ -24,13 +24,13 @@ use crate::disclosure::SDJWTDisclosure;
 use crate::signer::SDJWTSigner;
 use crate::utils::{base64_hash, encode};
 use crate::SDJWTCommon;
-use crate::{
-    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, KB_DIGEST_KEY, SD_DIGESTS_KEY, SD_LIST_PREFIX,
-};
 #[cfg(feature = "delegate")]
 use crate::{
     CNF_KEY, DEFAULT_DIGEST_ALG, DELEGATE_PAYLOAD_KEY, DIGEST_ALG_KEY, ISSUER_JWT_HASH_KEY,
     KB_JWT_TYP_HEADER, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER,
+};
+use crate::{
+    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, KB_DIGEST_KEY, SD_DIGESTS_KEY, SD_LIST_PREFIX,
 };
 
 pub struct SDJWTHolder {
@@ -62,7 +62,10 @@ impl SDJWTHolder {
     /// * `InvalidInput` - If the serialization format is not supported
     /// * `InvalidState` - If the SD JWT data is not valid
     /// * `DeserializationError` - If the SD JWT serialization is not valid
-    pub fn new(sd_jwt_with_disclosures: String, serialization_format: SDJWTSerializationFormat) -> Result<Self> {
+    pub fn new(
+        sd_jwt_with_disclosures: String,
+        serialization_format: SDJWTSerializationFormat,
+    ) -> Result<Self> {
         let mut holder = SDJWTHolder {
             sd_jwt_engine: SDJWTCommon {
                 serialization_format,
@@ -174,24 +177,25 @@ impl SDJWTHolder {
             }
         }
 
-        let sd_jwt_presentation = if self.sd_jwt_engine.serialization_format == SDJWTSerializationFormat::Compact {
-            let mut combined: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 2);
-            combined.push(&self.serialized_sd_jwt);
-            combined.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
-            combined.push(&self.serialized_key_binding_jwt);
-            combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
-        } else {
-            let mut sd_jwt_json = self
-                .sd_jwt_json
-                .take()
-                .ok_or(Error::InvalidState("Cannot take SDJWTJson".to_string()))?;
-            sd_jwt_json.disclosures = self.hs_disclosures.clone();
-            if !self.serialized_key_binding_jwt.is_empty() {
-                sd_jwt_json.kb_jwt = Some(self.serialized_key_binding_jwt.clone());
-            }
-            serde_json::to_string(&sd_jwt_json)
-                .map_err(|e| Error::DeserializationError(e.to_string()))?
-        };
+        let sd_jwt_presentation =
+            if self.sd_jwt_engine.serialization_format == SDJWTSerializationFormat::Compact {
+                let mut combined: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 2);
+                combined.push(&self.serialized_sd_jwt);
+                combined.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
+                combined.push(&self.serialized_key_binding_jwt);
+                combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            } else {
+                let mut sd_jwt_json = self
+                    .sd_jwt_json
+                    .take()
+                    .ok_or(Error::InvalidState("Cannot take SDJWTJson".to_string()))?;
+                sd_jwt_json.disclosures = self.hs_disclosures.clone();
+                if !self.serialized_key_binding_jwt.is_empty() {
+                    sd_jwt_json.kb_jwt = Some(self.serialized_key_binding_jwt.clone());
+                }
+                serde_json::to_string(&sd_jwt_json)
+                    .map_err(|e| Error::DeserializationError(e.to_string()))?
+            };
 
         Ok(sd_jwt_presentation)
     }
@@ -218,8 +222,7 @@ impl SDJWTHolder {
         self.set_key_binding_digest_key()?;
         // Create key-binding jwt
         let mut header = Header::new(
-            Algorithm::from_str(alg)
-                .map_err(|e| Error::DeserializationError(e.to_string()))?,
+            Algorithm::from_str(alg).map_err(|e| Error::DeserializationError(e.to_string()))?,
         );
 
         header.typ = Some(crate::KB_JWT_TYP_HEADER.into());
@@ -242,7 +245,6 @@ impl SDJWTHolder {
 
         Ok(())
     }
-
 }
 
 #[cfg(feature = "delegate")]
@@ -378,8 +380,10 @@ impl SDJWTHolder {
 
                     // Issuer segment.
                     prefix.push(chain.issuer_jwt.clone());
-                    let issuer_seg_droppable =
-                        segment_droppable(chain.links.first().map(|l| l.jwt.as_str()), binding_mode);
+                    let issuer_seg_droppable = segment_droppable(
+                        chain.links.first().map(|l| l.jwt.as_str()),
+                        binding_mode,
+                    );
                     for d in &chain.issuer_disclosures {
                         if drops.contains(d) {
                             if !issuer_seg_droppable {
@@ -433,7 +437,11 @@ impl SDJWTHolder {
                         )));
                     }
 
-                    (last_link.jwt.clone(), last_link_filtered_disclosures, prefix)
+                    (
+                        last_link.jwt.clone(),
+                        last_link_filtered_disclosures,
+                        prefix,
+                    )
                 }
             };
 
@@ -465,7 +473,7 @@ impl SDJWTHolder {
     }
 
     /// Select which `delegate_payload` alternative of the final chain link to
-    /// disclose in the next [`Self::present`]. `index` is the position in the
+    /// disclose in the next [`Self::create_presentation`]. `index` is the position in the
     /// `delegate_payloads` vector originally passed to [`Self::delegate`]. No effect
     /// for a single-alternative (inline) credential.
     pub fn select_delegate_alternative(&mut self, index: usize) {
@@ -488,7 +496,8 @@ impl SDJWTHolder {
         let stubs = link_delegate_payload_stubs(&last.jwt).ok_or_else(|| {
             Error::InvalidDelegatePayload("final chain link has no delegate_payload array".into())
         })?;
-        let alternative_hashes: HashSet<&String> = stubs.iter().filter_map(Option::as_ref).collect();
+        let alternative_hashes: HashSet<&String> =
+            stubs.iter().filter_map(Option::as_ref).collect();
 
         // No array-element disclosures ⇒ a single inline alternative; keep as-is.
         if alternative_hashes.is_empty() {
@@ -800,12 +809,14 @@ async fn build_kb_jwt<S: SDJWTSigner>(
 #[cfg(test)]
 mod tests {
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
-    use crate::{SDJWTHolder, SDJWTIssuer, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, SDJWTSerializationFormat};
+    use crate::key::SDJWTKey;
+    use crate::{
+        SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+    };
+    use async_std_test::async_test;
     use jsonwebtoken::EncodingKey;
     use serde_json::{json, Map, Value};
     use std::collections::HashSet;
-    use async_std_test::async_test;
-    use crate::key::SDJWTKey;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
     const PRIVATE_HOLDER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg0tI02eGRti3I3oVD\nJNJPjnqZPLoTgb1LjAKHghdHS6ihRANCAATcyYx2XscFQm+cq9hXjzhP+IhocalY\nWuBJDqoAjF1BtV159qmKAVtBk1RkN4rVlwGCvHElWbqzXQmbzi/psban\n-----END PRIVATE KEY-----\n";
@@ -834,21 +845,20 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
-        let presentation = SDJWTHolder::new(
-            sd_jwt.clone(),
-            SDJWTSerializationFormat::Compact,
-        )
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
+        let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation::<SDJWTKey>(
                 user_claims.as_object().unwrap().clone(),
@@ -856,7 +866,8 @@ mod tests {
                 None,
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(sd_jwt, presentation);
 
         Ok(())
@@ -878,31 +889,33 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
 
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
         let issued = sd_jwt.clone();
         user_claims["address"] = Value::Object(Map::new());
         user_claims["email"] = Value::Bool(false);
-        let presentation =
-            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
-                .unwrap()
-                .create_presentation::<SDJWTKey>(
-                    user_claims.as_object().unwrap().clone(),
-                    None,
-                    None,
-                    None,
-                )
-                .await.unwrap();
+        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                user_claims.as_object().unwrap().clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         let mut parts: Vec<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
@@ -934,33 +947,43 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
-        );
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::Custom(vec!["$.given_name", "$.family_name", "$.username", "$.email.work"]),
             None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None
-        )
-            .await.unwrap();
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::Custom(vec![
+                    "$.given_name",
+                    "$.family_name",
+                    "$.username",
+                    "$.email.work",
+                ]),
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
         // Choose what to reveal
         user_claims["given_name"] = Value::Bool(true);
         user_claims["family_name"] = Value::Bool(true);
         user_claims["username"] = Value::Bool(true);
-        user_claims["email"] = Value::Object(serde_json::Map::from_iter([("work".to_string(), Value::Bool(true))]));
+        user_claims["email"] = Value::Object(serde_json::Map::from_iter([(
+            "work".to_string(),
+            Value::Bool(true),
+        )]));
 
-        let _ =
-            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
-                .unwrap()
-                .create_presentation::<SDJWTKey>(
-                    user_claims.as_object().unwrap().clone(),
-                    None,
-                    None,
-                    None,
-                )
-                .await.unwrap();
+        let _ = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                user_claims.as_object().unwrap().clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         Ok(())
     }
 
@@ -1000,33 +1023,35 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            strategy,
-            None,
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        )
-            .await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                strategy,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
         // Choose what to reveal
         user_claims["addresses"] = Value::Array(vec![Value::Bool(true), Value::Bool(false)]);
         user_claims["nationalities"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
 
         let issued = sd_jwt.clone();
         println!("{}", issued);
-        let presentation =
-            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
-                .unwrap()
-                .create_presentation::<SDJWTKey>(
-                    user_claims.as_object().unwrap().clone(),
-                    None,
-                    None,
-                    None,
-                )
-                .await.unwrap();
+        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                user_claims.as_object().unwrap().clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         println!("{}", presentation);
         let mut issued_parts: HashSet<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
@@ -1139,24 +1164,26 @@ mod tests {
               }
         );
 
-        let presentation =
-            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
-                .unwrap()
-                .create_presentation::<SDJWTKey>(
-                    revealed.as_object().unwrap().clone(),
-                    None,
-                    None,
-                    None,
-                )
-                .await.unwrap();
+        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                revealed.as_object().unwrap().clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         let presentation: HashSet<_> = presentation
-            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR).map(String::from)
+            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .map(String::from)
             .collect();
 
         let expected: HashSet<_> = expected_presentation
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
-            .map(String::from).collect();
+            .map(String::from)
+            .collect();
 
         assert_eq!(presentation, expected);
 
@@ -1197,24 +1224,26 @@ mod tests {
               }
         );
 
-        let presentation =
-            SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
-                .unwrap()
-                .create_presentation::<SDJWTKey>(
-                    revealed.as_object().unwrap().clone(),
-                    None,
-                    None,
-                    None,
-                )
-                .await.unwrap();
+        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                revealed.as_object().unwrap().clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         let presentation: HashSet<_> = presentation
-            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR).map(String::from)
+            .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .map(String::from)
             .collect();
 
         let expected: HashSet<_> = expected_presentation
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
-            .map(String::from).collect();
+            .map(String::from)
+            .collect();
 
         assert_eq!(presentation, expected);
 
@@ -1222,9 +1251,7 @@ mod tests {
     }
 
     #[async_test]
-    #[should_panic(
-        expected = "Requested claim 'unknown' doesn't exist"
-    )]
+    #[should_panic(expected = "Requested claim 'unknown' doesn't exist")]
     async fn create_presentation_with_unknown_claim_to_reveal_should_fail() -> std::io::Result<()> {
         let sd_jwt = String::from("eyJhbGciOiJFUzI1NiJ9.eyJmb28iOlt7Ii4uLiI6Ii1XMWROTk0tNUI3WlpxR3R4MkF6RTA3X0hpRUpOZVJtNGtEQ1VORTVDNFUifSx7Ii4uLiI6ImpuUURqUEFoclY1bjMtRW5PVEZHWTcwMkd0T3FhN3hua3pVM0E4aElSX3cifV0sImJhciI6eyJfc2QiOlsiX25yZUxad2xVYlp1SmtqS1RVdHR5YkhqUTNrY2J4cnZab1dxUmVBbG4tcyIsImhGcjdBRElQbjZvQ3lSckNBN0VtNldLaGk1UjdXMWJjYWFZUFFrelpGMXciXX0sInF1eCI6W3siLi4uIjoieHl6MkRSSDRTSkpjdFFtMDEtSzROVVllMTMzMWh6U3VkTXd3MENDODEyUSJ9XSwiYmF6IjpbeyIuLi4iOiJRMGcyVmYzNnl6TnNvUkdNb0dsODZnZ2QyWGFVTmg5bGN6STFfbmFZYUhnIn0seyIuLi4iOiJZcGpMNTJKd1BfYmFFS21OaHFLazE3TWFrMl9fSWJCNmctY0haSHd6dmwwIn1dLCJhbmltYWxzIjp7Il9zZCI6WyJyQ19LNzlObG95SkFPWXRCOW9ITFlsTVJSS1V4UTNnaTZ0Wld0Zm90TWRjIiwidjUyd3d6bzB5Ymw2U2V1MjZWYklUODh5bHk1LXVMZkdlYTdkWnMxSHBwMCJdfSwiX3NkX2FsZyI6InNoYS0yNTYifQ.piidRp0pHJYmtExCJnLExaaWMTBX50mLwM6gFVYnD72DszyjpKbAoZhyAXT-I4CqqSpiHZg-2w8s26XBraqX6w~WyJCQ2k5UXlsWVVqVEpXWWVfbzRzOWxnIiwgIm9uZSJd~WyJSLXZ0bDBmbWF6N01zR1ZWRFh3T3BnIiwgInR3byJd~WyJXNWlOQ1Z1Qlo4OW9aV2dIUkxzRWJBIiwgInJlZCIsIDFd~WyJTQW5hNUJnaHJxUXJ0amR5SGxiejJBIiwgImdyZWVuIiwgMl0~WyJENVJrNVlIUkdJVXM5enp6OFUtOTVnIiwgImJsdWUiXQ~WyI0Y2tnSjJuWVhhV21jM3pVQ253d3N3IiwgInllbGxvdyJd~WyJ2Ml8tRG5JN0lEZ1loYVMzTG9Kb013IiwgW3siLi4uIjogIkhqMUQtZE1SNXR0YmpLcl9DUENETzRuVGlkTWR1YVNpMnlnYlhtcmR4MGcifSwgeyIuLi4iOiAiUl9Sb253SFY3bzR6Y0o3TV9jcTlobVpLZ2o2RkMtdmNXTko4bzNkeTg2MCJ9XV0~WyJwRHQtcEtfaklUYXhCVENJRFNvUnhBIiwgIm9yYW5nZSJd~WyJ1b3FDS0lpZGJzQmxhczhUaU5Kakh3IiwgInB1cnBsZSJd~WyJJWWFXMzVPNzBoUWg4OGlqWVBUVXZRIiwgW3siLi4uIjogIjlWdnFSbjk1ZUN6QnVkNkhYOG1faVRNMERZSVVxN0ZheFFtanowV1llbUkifSwgeyIuLi4iOiAiTmFOeXozWEJRZVc4Z1JRd28ySlN5NmhtbnJZT1JxRjMxeUhfWkhqbkRxNCJ9XV0~WyI4cFNkNHl0TWlPdnVGaFhQSXBPbW5BIiwgImJsYWNrIl0~WyJxLWR0QXhtZzY5cWZLMFpvS1BSbWFnIiwgIndoaXRlIl0~WyIzTzY0WmVYSjF6XzJWMXdrMGhJdUdBIiwgW3siLi4uIjogImRmVnVjbkwwMC1FVFh0RGpHaDlpRHYtSE5PZmRyZ1VuTlNYRk01VUlIRVkifSwgeyIuLi4iOiAiUlRnVmxQb25RTVZJNkEzNUJic21KTThDeDVTVTN1ZXJBMENyYmpvRW02USJ9XV0~WyJNQTlSbGMwUlAxNnVJWER6blRqOWJ3IiwgIm5hbWUiLCAicHl0aG9uIl0~WyJrblRLb0lKVzZuQ1VzeW1sN3lKWTNBIiwgImFnZSIsIDEwXQ~WyJlUEdwazZjdEhOSS1HS2JKbjZrR3lBIiwgInNuYWtlIiwgeyJfc2QiOiBbIjREU0s5REpJVEhROElITFFESld6SV9yM0lheXBIek5Ma19tc3BUa2xDVzQiLCAiYy11UFhEQkZJX2FDV1BUUHlYNFV0OWdDWW1DQ1FqUEw5TnRFZGotdWZtMCJdfV0~WyJOMzgyX2xTU1dpSzZsbGdPNFFhbUdnIiwgIm5hbWUiLCAiZWFnbGUiXQ~WyJjVWZVRVBrX0pDZm1KQzhWQUp1V1pBIiwgImFnZSIsIDIwXQ~WyJSVDh5My1Odmh6QXo4Q2ctS1NDRGh3IiwgImJpcmQiLCB7Il9zZCI6IFsiUVhINU9mSF8tMGtFYkEwWDBnd0RLenphc05ZYWRWekNWRGFrYlZfWnNxNCIsICJoUmtPNjRIVXZuaEFPbDBRS1NlZDFUWUhtb0VpRW9zb0R0WmsyRVl4ejdNIl19XQ~");
 
@@ -1265,7 +1292,8 @@ mod tests {
                 None,
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         Ok(())
     }
@@ -1288,21 +1316,24 @@ mod tests {
         let private_issuer_bytes = PRIVATE_ISSUER_PEM.as_bytes();
         let issuer_key = SDJWTKey::new(
             EncodingKey::from_ec_pem(private_issuer_bytes).unwrap(),
-            None
+            None,
         );
 
         let private_holder_bytes = PRIVATE_HOLDER_PEM.as_bytes();
         let holder_key = EncodingKey::from_ec_pem(private_holder_bytes).unwrap();
         let holder_public_jwk = serde_json::from_value(PUBLIC_HOLDER_JWK.parse().unwrap()).unwrap();
 
-        let sd_jwt = SDJWTIssuer::new(issuer_key).issue_sd_jwt(
-            user_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::AllLevels,
-            Some(holder_public_jwk),
-            false,
-            SDJWTSerializationFormat::Compact,
-            None,
-        ).await.unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                Some(holder_public_jwk),
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
 
         user_claims["address"] = Value::Object(Map::new());
         let presentation_with_kb =
@@ -1314,7 +1345,8 @@ mod tests {
                     Some("https://example.com/aud".to_string()),
                     Some(SDJWTKey::new(holder_key, None)),
                 )
-                .await.unwrap();
+                .await
+                .unwrap();
 
         // TODO: Validate Key Binding part
         let (presentation, _) = presentation_with_kb
