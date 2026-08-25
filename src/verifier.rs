@@ -16,6 +16,7 @@ use std::str::FromStr;
 use std::string::String;
 use std::vec::Vec;
 
+use crate::delegate::DelegationChain;
 #[cfg(feature = "delegate")]
 use crate::delegate::{compute_issuer_jwt_hash, compute_sd_hash};
 use crate::resolver::KeyResolver;
@@ -40,16 +41,22 @@ pub struct SDJWTVerifier {
     /// call (also returned directly from that method).
     pub verified_claims: Value,
 
-    /// Per-link `cnf` JWKs extracted while walking a delegation chain. Empty for a
-    /// plain SD-JWT(+KB). The last entry (when present) is the final Delegate
+    /// `cnf` JWKs extracted while walking a delegation chain — one per resolved
+    /// Delegate Payload alternative of each `kb+sd-jwt+kb` link, in chain order.
+    /// Empty for a plain SD-JWT(+KB). After [`Self::verify_presentation`] there is
+    /// at most one per link and the last entry (when present) is the final Delegate
     /// Holder's key, used to verify the trailing KB-JWT of a dSD-JWT+KB.
     #[cfg(feature = "delegate")]
     pub chain_cnfs: Vec<Jwk>,
 
-    /// The disclosed Delegate Payload of each KB-SD-JWT link, in chain order.
-    /// Empty when the input is not a delegation chain.
+    /// The disclosed Delegate Payload alternatives of each KB-SD-JWT link, in chain
+    /// order. Empty when the input is not a delegation chain. If
+    /// [`Self::verify_presentation`] produced this, every
+    /// `verified_delegate_payloads[i]` holds at most one alternative — a finished
+    /// presentation must have narrowed each link to one. Only
+    /// [`Self::verify_delegation`] can leave several open at a link.
     #[cfg(feature = "delegate")]
-    pub verified_delegate_payloads: Vec<Map<String, Value>>,
+    pub verified_delegate_payloads: Vec<Vec<Map<String, Value>>>,
 
     issuer_key_resolver: Box<dyn KeyResolver>,
 }
@@ -99,17 +106,9 @@ impl SDJWTVerifier {
         expected_nonce: Option<String>,
         serialization_format: SDJWTSerializationFormat,
     ) -> Result<Value> {
-        self.reset();
-        self.sd_jwt_engine = SDJWTCommon {
-            serialization_format,
-            ..Default::default()
-        };
-
-        self.sd_jwt_engine.parse_sd_jwt(sd_jwt_presentation)?;
-        self.sd_jwt_engine.create_hash_mappings()?;
-        let sign_alg = self.sd_jwt_engine.sign_alg.clone();
-        self.verify_sd_jwt(sign_alg.clone()).await?;
-        self.verified_claims = self.extract_sd_claims()?;
+        require_aud_nonce_pair(&expected_aud, &expected_nonce)?;
+        self.parse_and_verify_issuer(sd_jwt_presentation, serialization_format)
+            .await?;
 
         // For a delegation chain, walk the holder-signed KB-SD-JWT links, layering
         // each disclosed Delegate Payload onto `verified_claims`.
@@ -129,14 +128,32 @@ impl SDJWTVerifier {
             }
             #[cfg(not(feature = "delegate"))]
             self.verify_key_binding_jwt(expected_aud.to_owned(), expected_nonce.to_owned())?;
-        } else if expected_aud.is_some() || expected_nonce.is_some() {
-            return Err(Error::InvalidInput(
-                "Either both expected_aud and expected_nonce must be provided or both must be None"
-                    .to_string(),
-            ));
         }
 
         Ok(self.verified_claims.clone())
+    }
+
+    /// Parse `token`, verify the issuer-signed JWT's signature and set
+    /// [`Self::verified_claims`] to its unpacked claims. Shared prologue of
+    /// [`Self::verify_presentation`] and [`Self::verify_delegation`].
+    async fn parse_and_verify_issuer(
+        &mut self,
+        token: String,
+        serialization_format: SDJWTSerializationFormat,
+    ) -> Result<()> {
+        self.reset();
+        self.sd_jwt_engine = SDJWTCommon {
+            serialization_format,
+            ..Default::default()
+        };
+
+        self.sd_jwt_engine.parse_sd_jwt(token)?;
+        self.sd_jwt_engine.create_hash_mappings()?;
+        let sign_alg = self.sd_jwt_engine.sign_alg.clone();
+        self.verify_sd_jwt(sign_alg).await?;
+        self.verified_claims = self.extract_sd_claims()?;
+
+        Ok(())
     }
 
     #[cfg(feature = "delegate")]
@@ -171,14 +188,23 @@ impl SDJWTVerifier {
             // (`aud`, `nonce`) live in that link's Delegate Payload instead. The
             // chain walk already signature-verified the link and captured its
             // disclosed Delegate Payload, so validate `aud`/`nonce` there.
-            let final_payload = self.verified_delegate_payloads.last().ok_or_else(|| {
-                Error::InvalidDelegatePayload(
-                    "expected_aud/expected_nonce were provided but the delegation chain \
-                     produced no Delegate Payload to bind them"
-                        .into(),
-                )
-            })?;
-            verify_delegate_payload_binding(final_payload, expected_aud, expected_nonce)?;
+            let final_alternatives = self
+                .verified_delegate_payloads
+                .last()
+                .filter(|alternatives| !alternatives.is_empty())
+                .ok_or_else(|| {
+                    Error::InvalidDelegatePayload(
+                        "expected_aud/expected_nonce were provided but the delegation chain \
+                         produced no Delegate Payload to bind them"
+                            .into(),
+                    )
+                })?;
+            // A presentation has exactly one alternative here; a credential validated
+            // by a Delegate Holder may still have several — all of them were issued to
+            // the same delegate, so every one must carry the expected binding.
+            for payload in final_alternatives {
+                verify_delegate_payload_binding(payload, expected_aud, expected_nonce)?;
+            }
         }
         Ok(true)
     }
@@ -196,144 +222,41 @@ impl SDJWTVerifier {
 
     /// Walk the delegation chain. Called after `verify_sd_jwt` has verified the
     /// issuer-signed JWT (position 0) and `extract_sd_claims` has produced the
-    /// initial `verified_claims`. Each KB-SD-JWT link is signature-, binding-, and
-    /// `typ`-verified; its single disclosed Delegate Payload is layered onto
-    /// `verified_claims` and recorded in `verified_delegate_payloads`.
+    /// initial `verified_claims`. Runs [`walk_delegation_chain`] with
+    /// `enforce_single = true` and layers each link's resolved Delegate Payload
+    /// onto `verified_claims`.
     #[cfg(feature = "delegate")]
     fn verify_delegation_chain(&mut self) -> Result<()> {
         let chain = self
             .sd_jwt_engine
             .delegation_chain
             .as_ref()
-            .ok_or_else(|| Error::InvalidState("delegation_chain absent".into()))?
-            .clone();
+            .ok_or_else(|| Error::InvalidState("delegation_chain absent".into()))?;
         if chain.links.is_empty() {
             return Ok(());
         }
 
-        // Initial parent cnf = issuer-signed JWT's cnf.jwk.
-        let issuer_cnf_value = self
-            .verified_claims
-            .get(CNF_KEY)
-            .and_then(|c| c.get(JWK_KEY))
-            .cloned()
-            .ok_or_else(|| Error::ChainSignatureFailed {
-                link: 0,
-                reason: "issuer-signed JWT has no cnf.jwk for first chain link".into(),
-            })?;
-        let mut parent_cnf: Jwk =
-            serde_json::from_value(issuer_cnf_value).map_err(|e| Error::ChainSignatureFailed {
-                link: 0,
-                reason: format!("issuer cnf.jwk parse: {}", e),
-            })?;
+        if let Some(issuer_claims) = self.verified_claims.as_object() {
+            validate_lifetime(issuer_claims, "issuer-signed JWT", now_secs()?)?;
+        }
 
         // The disclosure map already spans ALL chain disclosures (input_disclosures
         // was set to chain.all_disclosures() during parsing).
-        let hash_to_decoded = self.sd_jwt_engine.hash_to_decoded_disclosure.clone();
+        // `enforce_single = true`: a finished presentation must have exactly one
+        // disclosed alternative per link.
+        let results = walk_delegation_chain(
+            chain,
+            &issuer_chain_cnf(&self.verified_claims)?,
+            &self.sd_jwt_engine.hash_to_decoded_disclosure,
+            true,
+        )?;
 
-        let mut parent_jwt = chain.issuer_jwt.clone();
-        let mut parent_disclosures = chain.issuer_disclosures.clone();
-        let trailing_kb_jwt_present = chain.trailing_kb_jwt.is_some();
-
-        let now = now_secs()?;
-        if let Some(issuer_claims) = self.verified_claims.as_object() {
-            validate_lifetime(issuer_claims, "issuer-signed JWT", now)?;
-        }
-
-        for (idx, link) in chain.links.iter().enumerate() {
-            let is_last = idx + 1 == chain.links.len();
-
-            // Verify the link signature using the preceding component's cnf.
-            let alg_str = SDJWTCommon::decode_header_and_get_sign_algorithm(&link.jwt)
-                .unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
-            let alg = Algorithm::from_str(&alg_str).map_err(|e| Error::ChainSignatureFailed {
-                link: idx,
-                reason: e.to_string(),
-            })?;
-            let decoding_key =
-                DecodingKey::from_jwk(&parent_cnf).map_err(|e| Error::ChainSignatureFailed {
-                    link: idx,
-                    reason: e.to_string(),
+        for result in results {
+            // `enforce_single = true` guarantees exactly one resolved alternative.
+            let delegate_payload =
+                result.delegate_payloads.into_iter().next().ok_or_else(|| {
+                    Error::InvalidState("chain walk produced no delegate payload".into())
                 })?;
-            let mut validation = Validation::new(alg);
-            validation.set_required_spec_claims::<&str>(&[]);
-            validation.validate_aud = false;
-            let decoded =
-                jsonwebtoken::decode::<Map<String, Value>>(&link.jwt, &decoding_key, &validation)
-                    .map_err(|e| Error::ChainSignatureFailed {
-                    link: idx,
-                    reason: e.to_string(),
-                })?;
-            let typ = decoded.header.typ.clone();
-            let payload = decoded.claims;
-
-            // typ check.
-            let is_kb_only = typ.as_deref() == Some(KB_SD_JWT_TYP_HEADER);
-            let is_kb_kb = typ.as_deref() == Some(KB_SD_JWT_KB_TYP_HEADER);
-            if is_last && !trailing_kb_jwt_present {
-                if !is_kb_only && !is_kb_kb {
-                    return Err(Error::ChainTypMismatch {
-                        link: idx,
-                        found: typ,
-                        expected: "kb+sd-jwt or kb+sd-jwt+kb",
-                    });
-                }
-            } else if !is_kb_kb {
-                // Intermediate link, OR last link of dSD-JWT+KB. Must be kb+sd-jwt+kb.
-                return Err(Error::ChainTypMismatch {
-                    link: idx,
-                    found: typ,
-                    expected: KB_SD_JWT_KB_TYP_HEADER,
-                });
-            }
-
-            // Binding validation (sd_hash or issuer_jwt_hash to the predecessor).
-            let sd_hash_claim = payload.get(KB_DIGEST_KEY).and_then(Value::as_str);
-            let issuer_jwt_hash_claim = payload.get(ISSUER_JWT_HASH_KEY).and_then(Value::as_str);
-            match (sd_hash_claim, issuer_jwt_hash_claim) {
-                (Some(claimed), None) => {
-                    if claimed != compute_sd_hash(&parent_jwt, &parent_disclosures) {
-                        return Err(Error::InvalidChainBinding { link: idx });
-                    }
-                }
-                (None, Some(claimed)) => {
-                    if claimed != compute_issuer_jwt_hash(&parent_jwt) {
-                        return Err(Error::InvalidChainBinding { link: idx });
-                    }
-                }
-                (None, None) => return Err(Error::MissingChainBinding { link: idx }),
-                (Some(_), Some(_)) => return Err(Error::AmbiguousChainBinding { link: idx }),
-            }
-
-            // Unpack the link payload against the shared disclosure map.
-            let mut seen = Vec::new();
-            let unpacked = unpack_disclosed_claims(
-                &Value::Object(payload.clone()),
-                &hash_to_decoded,
-                &mut seen,
-            )?;
-            let unpacked_obj = unpacked.as_object().cloned().ok_or_else(|| {
-                Error::InvalidDelegatePayload(format!(
-                    "link {}: unpacked KB-SD-JWT payload is not an object",
-                    idx
-                ))
-            })?;
-
-            // `delegate_payload` is mandatory; enforce the "exactly one disclosed
-            // alternative" rule.
-            if !payload.contains_key(DELEGATE_PAYLOAD_KEY) {
-                return Err(Error::InvalidDelegatePayload(format!(
-                    "link {}: KB-SD-JWT is missing the mandatory delegate_payload claim",
-                    idx
-                )));
-            }
-            enforce_delegate_payload_rule(idx, &payload, &unpacked_obj)?;
-
-            // The single disclosed Delegate Payload is "the JWT Payload" for this link.
-            let delegate_payload = disclosed_delegate_payload(idx, &unpacked_obj)?;
-
-            // Enforce this link's own lifetime (`exp`/`nbf`) before trusting it.
-            validate_lifetime(&delegate_payload, &format!("chain link {}", idx), now)?;
 
             // Layer the Delegate Payload's claims (link overrides issuer).
             if let Value::Object(ref mut existing) = self.verified_claims {
@@ -341,34 +264,72 @@ impl SDJWTVerifier {
                     existing.insert(k.clone(), v.clone());
                 }
             }
-            self.verified_delegate_payloads
-                .push(delegate_payload.clone());
-
-            // Extract next-hop cnf from the Delegate Payload, if applicable.
-            if is_kb_kb {
-                let cnf_value = delegate_payload
-                    .get(CNF_KEY)
-                    .and_then(|c| c.as_object())
-                    .and_then(|c| c.get(JWK_KEY))
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidDelegatePayload(format!(
-                            "link {}: typ={} but cnf.jwk is missing from Delegate Payload",
-                            idx, KB_SD_JWT_KB_TYP_HEADER
-                        ))
-                    })?;
-                let next_jwk: Jwk = serde_json::from_value(cnf_value).map_err(|e| {
-                    Error::InvalidDelegatePayload(format!("link {}: cnf.jwk parse: {}", idx, e))
-                })?;
-                self.chain_cnfs.push(next_jwk.clone());
-                parent_cnf = next_jwk;
-            }
-
-            parent_jwt = link.jwt.clone();
-            parent_disclosures = link.disclosures.clone();
+            self.verified_delegate_payloads.push(vec![delegate_payload]);
+            self.chain_cnfs.extend(result.next_cnfs);
         }
 
         Ok(())
+    }
+
+    /// Validate a delegation chain a Delegate Holder just received, verifying the
+    /// issuer-signed JWT and every link's signature, `typ`, binding hash and
+    /// lifetime. Returns the issuer-signed JWT's own claims; per-link Delegate
+    /// Payloads land in [`Self::verified_delegate_payloads`] (and their `cnf`s in
+    /// [`Self::chain_cnfs`]) rather than being merged into the return value.
+    ///
+    /// Unlike [`Self::verify_presentation`], links may still have several open
+    /// `delegate_payload` alternatives — narrowing to one is only required of a
+    /// finished presentation. `expected_aud`/`expected_nonce` (both or neither) are
+    /// checked against the trailing KB-JWT, or against every open alternative of
+    /// the final link. A plain, not-yet-delegated SD-JWT is accepted.
+    #[cfg(feature = "delegate")]
+    pub async fn verify_delegation(
+        &mut self,
+        dsd_jwt: String,
+        expected_aud: Option<String>,
+        expected_nonce: Option<String>,
+        serialization_format: SDJWTSerializationFormat,
+    ) -> Result<Map<String, Value>> {
+        require_aud_nonce_pair(&expected_aud, &expected_nonce)?;
+        self.parse_and_verify_issuer(dsd_jwt, serialization_format)
+            .await?;
+
+        let issuer_claims = self.verified_claims.as_object().cloned().ok_or_else(|| {
+            Error::InvalidState("unpacked issuer claims are not a JSON object".into())
+        })?;
+        validate_lifetime(&issuer_claims, "issuer-signed JWT", now_secs()?)?;
+
+        let chain;
+
+        if let Some(d_chain) = self.sd_jwt_engine.delegation_chain.as_ref() {
+            chain = d_chain;
+        } else if expected_aud.is_some() {
+            return Err(Error::InvalidInput(
+                "expected_aud/expected_nonce were provided but the token is not a dSD-JWT"
+                    .to_string(),
+            ));
+        } else {
+            return Ok(issuer_claims);
+        }
+
+        let results = walk_delegation_chain(
+            chain,
+            &issuer_chain_cnf(&self.verified_claims)?,
+            &self.sd_jwt_engine.hash_to_decoded_disclosure,
+            false,
+        )?;
+
+        for result in results {
+            self.chain_cnfs.extend(result.next_cnfs);
+            self.verified_delegate_payloads
+                .push(result.delegate_payloads);
+        }
+
+        if let (Some(aud), Some(nonce)) = (&expected_aud, &expected_nonce) {
+            self.verify_chain_key_binding(aud, nonce)?;
+        }
+
+        Ok(issuer_claims)
     }
 
     async fn verify_sd_jwt(&mut self, sign_alg: Option<String>) -> Result<()> {
@@ -377,9 +338,6 @@ impl SDJWTVerifier {
             .unverified_sd_jwt
             .as_ref()
             .ok_or(Error::ConversionError("reference".to_string()))?;
-        let parsed_header_sd_jwt = jsonwebtoken::decode_header(sd_jwt)
-            .map_err(|e| Error::DeserializationError(e.to_string()))?;
-
         let unverified_issuer = self
             .sd_jwt_engine
             .unverified_input_sd_jwt_payload
@@ -387,6 +345,8 @@ impl SDJWTVerifier {
             .ok_or(Error::ConversionError("reference".to_string()))?["iss"]
             .as_str()
             .ok_or(Error::ConversionError("str".to_string()))?;
+        let parsed_header_sd_jwt = jsonwebtoken::decode_header(sd_jwt)
+            .map_err(|e| Error::DeserializationError(e.to_string()))?;
         let issuer_public_key = self
             .issuer_key_resolver
             .resolve(unverified_issuer, &parsed_header_sd_jwt)
@@ -399,13 +359,10 @@ impl SDJWTVerifier {
         let mut validation = Validation::new(algorithm);
         // exp claim is required by library but is optional according to the spec (https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1.4)
         validation.required_spec_claims.remove("exp");
-        let claims = jsonwebtoken::decode(sd_jwt, &issuer_public_key, &validation)
+        self.sd_jwt_payload = jsonwebtoken::decode(sd_jwt, &issuer_public_key, &validation)
             .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {}", e)))?
             .claims;
 
-        let _ = sign_alg; //FIXME check algo
-
-        self.sd_jwt_payload = claims;
         self._holder_public_key_payload = self
             .sd_jwt_payload
             .get(CNF_KEY)
@@ -498,6 +455,37 @@ impl SDJWTVerifier {
             &mut seen,
         )
     }
+}
+
+/// The issuer-signed JWT's `cnf.jwk`, which the first chain link must be signed by.
+#[cfg(feature = "delegate")]
+fn issuer_chain_cnf(issuer_claims: &Value) -> Result<Jwk> {
+    let cnf = issuer_claims
+        .get(CNF_KEY)
+        .and_then(|c| c.get(JWK_KEY))
+        .cloned()
+        .ok_or_else(|| Error::ChainSignatureFailed {
+            link: 0,
+            reason: "issuer-signed JWT has no cnf.jwk for first chain link".into(),
+        })?;
+    serde_json::from_value(cnf).map_err(|e| Error::ChainSignatureFailed {
+        link: 0,
+        reason: format!("issuer cnf.jwk parse: {}", e),
+    })
+}
+
+/// `expected_aud` and `expected_nonce` must be given together or not at all.
+fn require_aud_nonce_pair(
+    expected_aud: &Option<String>,
+    expected_nonce: &Option<String>,
+) -> Result<()> {
+    if expected_aud.is_some() != expected_nonce.is_some() {
+        return Err(Error::InvalidInput(
+            "Either both expected_aud and expected_nonce must be provided or both must be None"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Leeway (seconds) applied to `exp`/`nbf` checks, matching `jsonwebtoken`'s
@@ -619,14 +607,14 @@ fn verify_delegate_payload_binding(
     Ok(())
 }
 
-/// Return the single disclosed Delegate Payload object of a link, i.e. the one
-/// element of the (unpacked) `delegate_payload` array. Assumes
-/// [`enforce_delegate_payload_rule`] has already validated the array.
+/// Return every disclosed Delegate Payload alternative of a link, i.e. the
+/// (unpacked) `delegate_payload` array's elements. Exactly one element when
+/// [`enforce_delegate_payload_rule`] ran with `enforce_single = true`.
 #[cfg(feature = "delegate")]
-fn disclosed_delegate_payload(
+fn disclosed_delegate_payloads(
     link_idx: usize,
     unpacked_obj: &Map<String, Value>,
-) -> Result<Map<String, Value>> {
+) -> Result<Vec<Map<String, Value>>> {
     let arr = unpacked_obj
         .get(DELEGATE_PAYLOAD_KEY)
         .and_then(Value::as_array)
@@ -636,28 +624,27 @@ fn disclosed_delegate_payload(
                 link_idx
             ))
         })?;
-    if arr.len() != 1 {
-        return Err(Error::InvalidDelegatePayload(format!(
-            "link {}: expected exactly one disclosed delegate_payload element, got {}",
-            link_idx,
-            arr.len()
-        )));
-    }
-    arr[0].as_object().cloned().ok_or_else(|| {
-        Error::InvalidDelegatePayload(format!(
-            "link {}: disclosed delegate_payload element is not a JSON object",
-            link_idx
-        ))
-    })
+    arr.iter()
+        .map(|v| {
+            v.as_object().cloned().ok_or_else(|| {
+                Error::InvalidDelegatePayload(format!(
+                    "link {}: disclosed delegate_payload element is not a JSON object",
+                    link_idx
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Enforce the `delegate_payload` array rules: non-empty; all-inline (single) or
-/// all-digest-stubs (multi); and, when stubs are used, exactly one disclosed.
+/// all-digest-stubs (multi); and, when stubs are used, at least one disclosed —
+/// exactly one when `enforce_single` is set (see [`walk_delegation_chain`]).
 #[cfg(feature = "delegate")]
 fn enforce_delegate_payload_rule(
     link_idx: usize,
     raw_payload: &Map<String, Value>,
     unpacked_payload: &Map<String, Value>,
+    enforce_single: bool,
 ) -> Result<()> {
     let raw_arr = raw_payload
         .get(DELEGATE_PAYLOAD_KEY)
@@ -699,20 +686,194 @@ fn enforce_delegate_payload_rule(
         )));
     }
     if stub_count > 0 {
-        // After unpacking, exactly one alternative must have resolved.
         let resolved = unpacked_payload
             .get(DELEGATE_PAYLOAD_KEY)
             .and_then(Value::as_array)
             .map(|a| a.len())
             .unwrap_or(0);
-        if resolved != 1 {
+        if resolved == 0 || (enforce_single && resolved != 1) {
             return Err(Error::InvalidDelegatePayload(format!(
-                "link {}: delegate_payload must have exactly one disclosed alternative, got {}",
-                link_idx, resolved
+                "link {}: delegate_payload must have {} disclosed alternative, got {}",
+                link_idx,
+                if enforce_single {
+                    "exactly one"
+                } else {
+                    "at least one"
+                },
+                resolved
             )));
         }
     }
     Ok(())
+}
+
+/// Per-link result of [`walk_delegation_chain`].
+#[cfg(feature = "delegate")]
+struct ChainLinkResult {
+    /// Disclosed Delegate Payload alternatives for this link, in array order.
+    /// Exactly one when the walk was run with `enforce_single = true`.
+    delegate_payloads: Vec<Map<String, Value>>,
+    /// `cnf.jwk` carried by each alternative above (only for a `kb+sd-jwt+kb`
+    /// link) — one candidate signing key per resolved alternative, since each
+    /// may address a different next hop. Empty for a terminal (`kb+sd-jwt`) link.
+    next_cnfs: Vec<Jwk>,
+}
+
+/// Walk a delegation chain's KB-SD-JWT links, verifying each one's signature
+/// (against a candidate key from the preceding component), `typ`, binding hash,
+/// and lifetime, and unpacking its `delegate_payload`.
+///
+/// `enforce_single` controls whether each link must resolve to exactly one
+/// disclosed alternative:
+/// * `true` — required for a finished presentation reaching a Verifier: every
+///   link has necessarily been narrowed to one by the time it's presented.
+/// * `false` — used when a Delegate Holder validates a credential it just
+///   received (see [`SDJWTVerifier::verify_delegation`]),
+///   which may still bundle several open alternatives at any link, each
+///   carrying its own `cnf` for a possibly different next hop. All resolved
+///   alternatives at a link become candidate signing keys for the next one.
+#[cfg(feature = "delegate")]
+fn walk_delegation_chain(
+    chain: &crate::delegate::DelegationChain,
+    issuer_cnf: &Jwk,
+    hash_to_decoded: &HashMap<String, Value>,
+    enforce_single: bool,
+) -> Result<Vec<ChainLinkResult>> {
+    let mut results = Vec::with_capacity(chain.links.len());
+    let mut parent_jwt = chain.issuer_jwt.clone();
+    let mut parent_disclosures = chain.issuer_disclosures.clone();
+    let mut parent_cnfs = vec![issuer_cnf.clone()];
+    let trailing_kb_jwt_present = chain.trailing_kb_jwt.is_some();
+    let now = now_secs()?;
+
+    for (idx, link) in chain.links.iter().enumerate() {
+        let is_last = idx + 1 == chain.links.len();
+
+        // Verify the link signature against one of the preceding component's
+        // candidate keys (usually one; more than one only when a predecessor link
+        // still has multiple open alternatives, each with its own cnf).
+        let alg_str = SDJWTCommon::decode_header_and_get_sign_algorithm(&link.jwt)
+            .unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
+        let alg = Algorithm::from_str(&alg_str).map_err(|e| Error::ChainSignatureFailed {
+            link: idx,
+            reason: e.to_string(),
+        })?;
+        let mut validation = Validation::new(alg);
+        validation.set_required_spec_claims::<&str>(&[]);
+        validation.validate_aud = false;
+        let decoded = parent_cnfs
+            .iter()
+            .find_map(|cnf| {
+                let decoding_key = DecodingKey::from_jwk(cnf).ok()?;
+                jsonwebtoken::decode::<Map<String, Value>>(&link.jwt, &decoding_key, &validation)
+                    .ok()
+            })
+            .ok_or_else(|| Error::ChainSignatureFailed {
+                link: idx,
+                reason: "signature does not match any candidate parent key".to_string(),
+            })?;
+        let typ = decoded.header.typ.clone();
+        let payload = decoded.claims;
+
+        // typ check.
+        let is_kb_only = typ.as_deref() == Some(KB_SD_JWT_TYP_HEADER);
+        let is_kb_kb = typ.as_deref() == Some(KB_SD_JWT_KB_TYP_HEADER);
+        if is_last && !trailing_kb_jwt_present {
+            if !is_kb_only && !is_kb_kb {
+                return Err(Error::ChainTypMismatch {
+                    link: idx,
+                    found: typ,
+                    expected: "kb+sd-jwt or kb+sd-jwt+kb",
+                });
+            }
+        } else if !is_kb_kb {
+            // Intermediate link, OR last link of dSD-JWT+KB. Must be kb+sd-jwt+kb.
+            return Err(Error::ChainTypMismatch {
+                link: idx,
+                found: typ,
+                expected: KB_SD_JWT_KB_TYP_HEADER,
+            });
+        }
+
+        // Binding validation (sd_hash or issuer_jwt_hash to the predecessor).
+        let sd_hash_claim = payload.get(KB_DIGEST_KEY).and_then(Value::as_str);
+        let issuer_jwt_hash_claim = payload.get(ISSUER_JWT_HASH_KEY).and_then(Value::as_str);
+        match (sd_hash_claim, issuer_jwt_hash_claim) {
+            (Some(claimed), None) => {
+                if claimed != compute_sd_hash(&parent_jwt, &parent_disclosures) {
+                    return Err(Error::InvalidChainBinding { link: idx });
+                }
+            }
+            (None, Some(claimed)) => {
+                if claimed != compute_issuer_jwt_hash(&parent_jwt) {
+                    return Err(Error::InvalidChainBinding { link: idx });
+                }
+            }
+            (None, None) => return Err(Error::MissingChainBinding { link: idx }),
+            (Some(_), Some(_)) => return Err(Error::AmbiguousChainBinding { link: idx }),
+        }
+
+        // Unpack the link payload against the shared disclosure map.
+        let mut seen = Vec::new();
+        let unpacked =
+            unpack_disclosed_claims(&Value::Object(payload.clone()), hash_to_decoded, &mut seen)?;
+        let unpacked_obj = unpacked.as_object().cloned().ok_or_else(|| {
+            Error::InvalidDelegatePayload(format!(
+                "link {}: unpacked KB-SD-JWT payload is not an object",
+                idx
+            ))
+        })?;
+
+        // `delegate_payload` is mandatory; enforce the disclosed-alternative rule.
+        if !payload.contains_key(DELEGATE_PAYLOAD_KEY) {
+            return Err(Error::InvalidDelegatePayload(format!(
+                "link {}: KB-SD-JWT is missing the mandatory delegate_payload claim",
+                idx
+            )));
+        }
+        enforce_delegate_payload_rule(idx, &payload, &unpacked_obj, enforce_single)?;
+        let delegate_payloads = disclosed_delegate_payloads(idx, &unpacked_obj)?;
+
+        // Enforce every resolved alternative's own lifetime (`exp`/`nbf`) before
+        // trusting it — any of them could end up being the one eventually chosen.
+        for dp in &delegate_payloads {
+            validate_lifetime(dp, &format!("chain link {}", idx), now)?;
+        }
+
+        // Extract next-hop candidate cnfs, if applicable — one per alternative.
+        let mut next_cnfs = Vec::new();
+        if is_kb_kb {
+            for dp in &delegate_payloads {
+                let cnf_value = dp
+                    .get(CNF_KEY)
+                    .and_then(|c| c.as_object())
+                    .and_then(|c| c.get(JWK_KEY))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidDelegatePayload(format!(
+                            "link {}: typ={} but cnf.jwk is missing from a delegate_payload alternative",
+                            idx, KB_SD_JWT_KB_TYP_HEADER
+                        ))
+                    })?;
+                next_cnfs.push(serde_json::from_value(cnf_value).map_err(|e| {
+                    Error::InvalidDelegatePayload(format!("link {}: cnf.jwk parse: {}", idx, e))
+                })?);
+            }
+        }
+
+        parent_jwt = link.jwt.clone();
+        parent_disclosures = link.disclosures.clone();
+        // A non-`kb+sd-jwt+kb` link is necessarily the last one (see the typ check
+        // above), so an unconditional assign is safe — `next_cnfs` is empty there.
+        parent_cnfs = next_cnfs.clone();
+
+        results.push(ChainLinkResult {
+            delegate_payloads,
+            next_cnfs,
+        });
+    }
+
+    Ok(results)
 }
 
 /// Recursively unpack disclosed claims, resolving digests against

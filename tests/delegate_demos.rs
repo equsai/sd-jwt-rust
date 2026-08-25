@@ -40,7 +40,10 @@ fn issuer_key_resolver() -> Box<dyn KeyResolver> {
 
 /// The original Holder's signer (P-256 / ES256), matching `HOLDER_JWK_KEY`.
 fn holder_signer() -> SDJWTKey {
-    SDJWTKey::new(EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap(), None)
+    SDJWTKey::new(
+        EncodingKey::from_ec_pem(HOLDER_KEY.as_bytes()).unwrap(),
+        None,
+    )
 }
 
 /// Delegate Holder #1's signer (Ed25519 / EdDSA), matching `DELEGATE2_JWK`.
@@ -129,10 +132,69 @@ async fn single_delegation_no_final_kb_round_trips() -> std::io::Result<()> {
     // Issuer claims must also still be visible.
     assert_eq!(claims.get("sub"), Some(&Value::String("alice".into())));
     assert_eq!(
-        claims.get("address").and_then(|v| v.as_object())
+        claims
+            .get("address")
+            .and_then(|v| v.as_object())
             .and_then(|o| o.get("country")),
         Some(&Value::String("DE".into())),
     );
+    Ok(())
+}
+
+#[async_test]
+async fn verify_delegation_checks_aud_and_nonce() -> std::io::Result<()> {
+    let user_claims = json!({
+        "iss": "https://example.com/issuer",
+        "iat": 1683000000,
+        "exp": 1883000000,
+        "sub": "carol",
+    });
+    let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
+    let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk).await;
+
+    // Two open alternatives, both delegated to the same Delegate Holder.
+    let dsd_jwt = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+        .unwrap()
+        .delegate(
+            vec![
+                json!({"aud": "delegate.example", "nonce": "n-1", "mandate": "card"}),
+                json!({"aud": "delegate.example", "nonce": "n-1", "mandate": "bank"}),
+            ],
+            Some(Map::new()),
+            None,
+            holder_signer(),
+            ChainBindingMode::SdHash,
+        )
+        .await
+        .unwrap();
+
+    // Matching aud/nonce ⇒ accepted.
+    SDJWTVerifier::new(issuer_key_resolver())
+        .verify_delegation(
+            dsd_jwt.clone(),
+            Some("delegate.example".to_string()),
+            Some("n-1".to_string()),
+            SDJWTSerializationFormat::Compact,
+        )
+        .await
+        .expect("aud/nonce present in every alternative must verify");
+
+    // Wrong nonce, wrong aud, and only one of the two provided ⇒ all rejected.
+    for (aud, nonce) in [
+        (Some("delegate.example"), Some("n-2")),
+        (Some("other.example"), Some("n-1")),
+        (Some("delegate.example"), None),
+    ] {
+        assert!(SDJWTVerifier::new(issuer_key_resolver())
+            .verify_delegation(
+                dsd_jwt.clone(),
+                aud.map(str::to_string),
+                nonce.map(str::to_string),
+                SDJWTSerializationFormat::Compact,
+            )
+            .await
+            .is_err());
+    }
     Ok(())
 }
 
@@ -162,12 +224,47 @@ async fn delegate_payload_appears_in_delegate_payloads() -> std::io::Result<()> 
 
     let mut verifier = SDJWTVerifier::new(issuer_key_resolver());
     verifier
-        .verify_presentation(dsd_jwt, None, None, SDJWTSerializationFormat::Compact)
+        .verify_presentation(
+            dsd_jwt.clone(),
+            None,
+            None,
+            SDJWTSerializationFormat::Compact,
+        )
         .await
         .unwrap();
 
-    let dp = &verifier.verified_delegate_payloads[0];
+    let dp = &verifier.verified_delegate_payloads[0][0];
     assert_eq!(dp.get("scope"), Some(&Value::String("read-only".into())));
+
+    // A Delegate Holder's own validation returns just the issuer-signed JWT's
+    // claims; the (already-narrowed) Delegate Payload lives in
+    // `verified_delegate_payloads` instead, same info a presentation exposes.
+    let mut delegate = SDJWTVerifier::new(issuer_key_resolver());
+    let issuer_claims = delegate
+        .verify_delegation(dsd_jwt.clone(), None, None, SDJWTSerializationFormat::Compact)
+        .await
+        .unwrap();
+    assert_eq!(
+        issuer_claims.get("iss"),
+        Some(&Value::String("https://example.com/issuer".into()))
+    );
+    // One link, narrowed to exactly one alternative — same shape a finished
+    // presentation would yield.
+    assert_eq!(delegate.verified_delegate_payloads.len(), 1);
+    assert_eq!(delegate.verified_delegate_payloads[0].len(), 1);
+    assert_eq!(
+        delegate.verified_delegate_payloads[0][0].get("scope"),
+        Some(&Value::String("read-only".into()))
+    );
+    assert!(delegate.chain_cnfs.is_empty()); // no `cnf` in the payload ⇒ terminal link
+
+    // Wrong issuer key ⇒ the issuer-signed JWT's signature check must fail.
+    assert!(SDJWTVerifier::new(Box::new(SDJWTPubKey::from(
+        DecodingKey::from_jwk(&serde_json::from_str::<Jwk>(HOLDER_JWK_KEY).unwrap()).unwrap()
+    )))
+    .verify_delegation(dsd_jwt, None, None, SDJWTSerializationFormat::Compact)
+    .await
+    .is_err());
     Ok(())
 }
 
@@ -202,8 +299,14 @@ async fn issuer_jwt_hash_binding_mode_works() -> std::io::Result<()> {
     // empty component (`~~`), so the layout is:
     //   <issuer-jwt> ~~ <KB-SD-JWT> ~ <D'1>...<D'N> ~
     let parts: Vec<&str> = dsd_jwt.split('~').collect();
-    assert!(parts[1].is_empty(), "expected mandatory empty component after issuer JWT");
-    assert!(parts[2].contains('.'), "expected KB-SD-JWT at position 2 (after ~~)");
+    assert!(
+        parts[1].is_empty(),
+        "expected mandatory empty component after issuer JWT"
+    );
+    assert!(
+        parts[2].contains('.'),
+        "expected KB-SD-JWT at position 2 (after ~~)"
+    );
 
     let mut verifier = SDJWTVerifier::new(issuer_key_resolver());
     let verified_claims = verifier
@@ -269,7 +372,12 @@ async fn dsd_jwt_with_kb_proof_of_possession_round_trips() -> std::io::Result<()
     // Verifier walks the chain AND validates the final KB-JWT.
     let mut verifier = SDJWTVerifier::new(issuer_key_resolver());
     let verified_claims = verifier
-        .verify_presentation(presentation, Some(aud), Some(nonce), SDJWTSerializationFormat::Compact)
+        .verify_presentation(
+            presentation,
+            Some(aud),
+            Some(nonce),
+            SDJWTSerializationFormat::Compact,
+        )
         .await
         .expect("dSD-JWT+KB verification should succeed");
 
@@ -280,7 +388,10 @@ async fn dsd_jwt_with_kb_proof_of_possession_round_trips() -> std::io::Result<()
         "kb+sd-jwt+kb link must yield one cnf in chain_cnfs"
     );
     let claims = verified_claims.as_object().unwrap();
-    assert_eq!(claims.get("scope"), Some(&Value::String("view-account".into())));
+    assert_eq!(
+        claims.get("scope"),
+        Some(&Value::String("view-account".into()))
+    );
     Ok(())
 }
 
@@ -552,7 +663,8 @@ async fn redelegation_can_drop_issuer_disclosures_when_link1_used_issuer_jwt_has
     drops.insert(drop_target.clone());
 
     // Hop 2: Delegate Holder #1 re-delegates and drops one issuer disclosure.
-    let mut delegate1 = SDJWTHolder::new(after_hop1.clone(), SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate1 =
+        SDJWTHolder::new(after_hop1.clone(), SDJWTSerializationFormat::Compact).unwrap();
     let after_hop2 = delegate1
         .delegate(
             vec![json!({"hop": 2})],
@@ -670,7 +782,11 @@ async fn redelegation_narrows_multi_alternative_predecessor_link() -> std::io::R
         .filter(|t| !t.is_empty() && !t.contains('.'))
         .map(String::from)
         .collect();
-    assert_eq!(alternatives.len(), 2, "expected two alternative disclosures");
+    assert_eq!(
+        alternatives.len(),
+        2,
+        "expected two alternative disclosures"
+    );
     // Drop one alternative, leaving exactly one disclosed.
     let mut drops: HashSet<String> = HashSet::new();
     drops.insert(alternatives[0].clone());
@@ -772,7 +888,8 @@ async fn multi_alternative_select_and_present_round_trips() -> std::io::Result<(
         .unwrap();
 
     // Selecting alternative #1 and presenting reveals only "verifier-b".
-    let mut delegate = SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate =
+        SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
     delegate.select_delegate_alternative(1);
     let presentation = delegate
         .create_presentation::<SDJWTKey>(Map::new(), None, None, None)
@@ -791,7 +908,8 @@ async fn multi_alternative_select_and_present_round_trips() -> std::io::Result<(
     );
 
     // Presenting without selecting an alternative must error.
-    let mut delegate2 = SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
+    let mut delegate2 =
+        SDJWTHolder::new(dsd_jwt.clone(), SDJWTSerializationFormat::Compact).unwrap();
     assert!(
         delegate2
             .create_presentation::<SDJWTKey>(Map::new(), None, None, None)
@@ -808,6 +926,97 @@ async fn multi_alternative_select_and_present_round_trips() -> std::io::Result<(
             .await
             .is_err(),
         "a multi-alternative token with more than one disclosed must be rejected"
+    );
+    Ok(())
+}
+
+#[async_test]
+async fn delegate_holder_validates_multiple_open_alternatives_at_every_link() -> std::io::Result<()>
+{
+    // AP2-style chain: hop 1 bundles two Checkout Mandate alternatives; Delegate
+    // Holder #1 re-delegates WITHOUT narrowing them (both stay open) and itself
+    // bundles two Payment Mandate alternatives for hop 2. Neither link has been
+    // narrowed to one disclosed alternative — a legitimate in-flight credential,
+    // not a finished presentation.
+    let user_claims = json!({
+        "iss": "https://example.com/issuer",
+        "iat": 1683000000,
+        "exp": 1883000000,
+        "sub": "mandate-holder"
+    });
+    let holder_jwk: Jwk = serde_json::from_str(HOLDER_JWK_KEY).unwrap();
+    let sd_jwt = issue_holder_bound_sd_jwt(user_claims, holder_jwk).await;
+
+    let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+    let after_hop1 = holder
+        .delegate(
+            vec![
+                json!({"mandate": "checkout-open", "cnf": cnf_claim(DELEGATE2_JWK)}),
+                json!({"mandate": "checkout-closed", "cnf": cnf_claim(DELEGATE2_JWK)}),
+            ],
+            Some(Map::new()),
+            None,
+            holder_signer(),
+            ChainBindingMode::SdHash,
+        )
+        .await
+        .unwrap();
+
+    let mut delegate1 = SDJWTHolder::new(after_hop1, SDJWTSerializationFormat::Compact).unwrap();
+    let after_hop2 = delegate1
+        .delegate(
+            vec![
+                json!({"mandate": "payment-card"}),
+                json!({"mandate": "payment-bank"}),
+            ],
+            None,
+            None, // no drops: hop 1's two alternatives both stay open
+            delegate2_signer(),
+            ChainBindingMode::SdHash,
+        )
+        .await
+        .expect("re-delegating without narrowing the predecessor link must be permitted");
+
+    // Delegate Holder #2 receives a chain with four still-open alternatives
+    // across two links; validating it must succeed.
+    let mut delegate2 = SDJWTVerifier::new(issuer_key_resolver());
+    let issuer_claims = delegate2
+        .verify_delegation(after_hop2.clone(), None, None, SDJWTSerializationFormat::Compact)
+        .await
+        .expect("Delegate Holder validation must allow multiple open alternatives at any link");
+
+    // Only the issuer-signed JWT's own claims come back here.
+    assert_eq!(
+        issuer_claims.get("iss"),
+        Some(&Value::String("https://example.com/issuer".into()))
+    );
+
+    // Both links still have their two open alternatives — exposed via
+    // `verified_delegate_payloads`, not the returned issuer claims.
+    assert_eq!(delegate2.verified_delegate_payloads.len(), 2);
+    assert_eq!(delegate2.verified_delegate_payloads[0].len(), 2);
+    assert_eq!(delegate2.verified_delegate_payloads[1].len(), 2);
+    let hop1_mandates: HashSet<&str> = delegate2.verified_delegate_payloads[0]
+        .iter()
+        .filter_map(|dp| dp.get("mandate").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        hop1_mandates,
+        HashSet::from(["checkout-open", "checkout-closed"])
+    );
+    // Hop 1's two alternatives both carry the same cnf, and hop 2 has no cnf
+    // (terminal link) ⇒ two candidate keys total, both for hop 1.
+    assert_eq!(delegate2.chain_cnfs.len(), 2);
+
+    // The same, un-narrowed artifact must NOT verify as a finished presentation:
+    // a Verifier requires every link to resolve to exactly one alternative.
+    let mut verifier = SDJWTVerifier::new(issuer_key_resolver());
+    assert!(
+        verifier
+            .verify_presentation(after_hop2, None, None, SDJWTSerializationFormat::Compact)
+            .await
+            .is_err(),
+        "a Verifier must reject a presentation where any link still has multiple disclosed alternatives"
     );
     Ok(())
 }
@@ -974,7 +1183,9 @@ async fn aud_nonce_in_final_kb_sd_jwt_kb_payload_round_trips() -> std::io::Resul
             SDJWTSerializationFormat::Compact,
         )
         .await
-        .expect("aud/nonce in a kb+sd-jwt+kb Delegate Payload must verify without a trailing KB-JWT");
+        .expect(
+            "aud/nonce in a kb+sd-jwt+kb Delegate Payload must verify without a trailing KB-JWT",
+        );
     Ok(())
 }
 
