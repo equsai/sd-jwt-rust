@@ -16,9 +16,8 @@ use std::str::FromStr;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::delegate::DelegationChain;
 #[cfg(feature = "delegate")]
-use crate::delegate::{compute_issuer_jwt_hash, compute_sd_hash};
+use crate::delegate::{compute_issuer_jwt_hash, compute_sd_hash, DelegationChain};
 use crate::resolver::KeyResolver;
 use crate::utils::base64_hash;
 use crate::{
