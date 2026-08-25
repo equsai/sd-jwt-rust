@@ -16,6 +16,7 @@ use std::str::FromStr;
 use std::string::String;
 use std::vec::Vec;
 
+use crate::delegate::DelegationChain;
 #[cfg(feature = "delegate")]
 use crate::delegate::{compute_issuer_jwt_hash, compute_sd_hash};
 use crate::resolver::KeyResolver;
@@ -298,16 +299,19 @@ impl SDJWTVerifier {
         })?;
         validate_lifetime(&issuer_claims, "issuer-signed JWT", now_secs()?)?;
 
-        let chain = match self.sd_jwt_engine.delegation_chain.as_ref() {
-            Some(chain) => chain,
-            None if expected_aud.is_some() => {
-                return Err(Error::InvalidInput(
-                    "expected_aud/expected_nonce were provided but the token is not a dSD-JWT"
-                        .to_string(),
-                ))
-            }
-            None => return Ok(issuer_claims),
-        };
+        let chain;
+
+        if let Some(d_chain) = self.sd_jwt_engine.delegation_chain.as_ref() {
+            chain = d_chain;
+        } else if expected_aud.is_some() {
+            return Err(Error::InvalidInput(
+                "expected_aud/expected_nonce were provided but the token is not a dSD-JWT"
+                    .to_string(),
+            ));
+        } else {
+            return Ok(issuer_claims);
+        }
+
         let results = walk_delegation_chain(
             chain,
             &issuer_chain_cnf(&self.verified_claims)?,
